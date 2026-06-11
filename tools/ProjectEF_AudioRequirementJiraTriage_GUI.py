@@ -1765,6 +1765,8 @@ class TriageGui(tk.Tk):
         self.filter_label_var = tk.StringVar(value="All")
         self.status_var = tk.StringVar(value="Ready. Scan Design or Load Index first.")
         self.summary_var = tk.StringVar(value="")
+        self.selected_summary_var = tk.StringVar(value="Select a Jira issue to view matched design evidence.")
+        self.detail_visible_var = tk.BooleanVar(value=False)
 
         self.index: dict[str, Any] = {}
         self.latest_diff: dict[str, Any] = {}
@@ -1774,6 +1776,9 @@ class TriageGui(tk.Tk):
         self.version_filter_combo: ttk.Combobox | None = None
         self.start_filter_combo: ttk.Combobox | None = None
         self.filter_combos: dict[str, ttk.Combobox] = {}
+        self.detail_frame: tk.Frame | None = None
+        self.evidence_frame: tk.Frame | None = None
+        self.detail_toggle_button: tk.Button | None = None
 
         self.configure_style()
         self.build_ui()
@@ -1902,28 +1907,28 @@ class TriageGui(tk.Tk):
         filter_grid.pack(anchor="w", padx=8, pady=8)
         self.system_filter_combo = self.add_filter_combo(filter_grid, 0, 0, "System", self.filter_system_var, 13)
         self.version_filter_combo = self.add_filter_combo(filter_grid, 0, 1, "Version", self.filter_version_var, 14)
-        self.start_filter_combo = self.add_filter_combo(filter_grid, 0, 2, "Start", self.filter_start_var, 13)
-        self.add_filter_combo(filter_grid, 0, 3, "Audio", self.filter_audio_var, 10)
-        self.add_filter_combo(filter_grid, 0, 4, "Ready", self.filter_ready_var, 14)
-        self.add_filter_combo(filter_grid, 0, 5, "Status", self.filter_status_var, 12)
+        self.add_filter_combo(filter_grid, 0, 2, "Status", self.filter_status_var, 12)
+        self.start_filter_combo = self.add_filter_combo(filter_grid, 0, 3, "Start", self.filter_start_var, 13)
+        self.add_filter_combo(filter_grid, 0, 4, "Audio", self.filter_audio_var, 10)
+        self.add_filter_combo(filter_grid, 0, 5, "Ready", self.filter_ready_var, 14)
         self.add_filter_combo(filter_grid, 0, 6, "Type", self.filter_type_var, 14)
-        self.add_filter_combo(filter_grid, 0, 7, "Assignee", self.filter_assignee_var, 16)
-        self.add_filter_combo(filter_grid, 0, 8, "Reporter", self.filter_reporter_var, 16)
-        self.add_filter_combo(filter_grid, 1, 0, "Creator", self.filter_creator_var, 16)
-        self.add_filter_combo(filter_grid, 1, 1, "Priority", self.filter_priority_var, 12)
-        self.add_filter_combo(filter_grid, 1, 2, "Design Area", self.filter_design_area_var, 24)
-        self.add_filter_combo(filter_grid, 1, 3, "Design Doc", self.filter_design_doc_var, 34)
-        self.add_filter_combo(filter_grid, 1, 4, "Dependency", self.filter_dependency_var, 24)
-        self.add_filter_combo(filter_grid, 1, 5, "Component", self.filter_component_var, 18)
-        self.add_filter_combo(filter_grid, 1, 6, "Label", self.filter_label_var, 18)
+        self.add_filter_combo(filter_grid, 1, 0, "Reporter", self.filter_reporter_var, 16)
+        self.add_filter_combo(filter_grid, 1, 1, "Creator", self.filter_creator_var, 16)
+        self.add_filter_combo(filter_grid, 1, 2, "Assignee", self.filter_assignee_var, 16)
+        self.add_filter_combo(filter_grid, 1, 3, "Priority", self.filter_priority_var, 12)
+        self.add_filter_combo(filter_grid, 1, 4, "Component", self.filter_component_var, 18)
+        self.add_filter_combo(filter_grid, 1, 5, "Label", self.filter_label_var, 18)
+        self.add_filter_combo(filter_grid, 2, 0, "Design Area", self.filter_design_area_var, 22)
+        self.add_filter_combo(filter_grid, 2, 1, "Design Doc", self.filter_design_doc_var, 34)
+        self.add_filter_combo(filter_grid, 2, 2, "Dependency", self.filter_dependency_var, 28)
 
-        paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=BG, sashwidth=6)
+        paned = tk.PanedWindow(self, orient=tk.VERTICAL, bg=BG, sashwidth=6)
         paned.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
 
-        left = tk.Frame(paned, bg=BG)
-        paned.add(left, minsize=720, width=850)
+        top = tk.Frame(paned, bg=BG)
+        paned.add(top, minsize=260, height=380)
         columns = ("key", "required", "start", "ready", "system", "version", "design", "dependency", "confidence", "status", "summary", "evidence")
-        self.issue_tree = ttk.Treeview(left, columns=columns, show="headings", selectmode="extended")
+        self.issue_tree = ttk.Treeview(top, columns=columns, show="headings", selectmode="extended")
         headings = {
             "key": "Jira",
             "required": "Audio?",
@@ -1955,26 +1960,51 @@ class TriageGui(tk.Tk):
         for col in columns:
             self.issue_tree.heading(col, text=headings[col])
             self.issue_tree.column(col, width=widths[col], anchor=tk.W)
-        self.issue_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        issue_scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.issue_tree.yview)
-        issue_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.issue_tree.configure(yscrollcommand=issue_scroll.set)
+        issue_y = ttk.Scrollbar(top, orient=tk.VERTICAL, command=self.issue_tree.yview)
+        issue_x = ttk.Scrollbar(top, orient=tk.HORIZONTAL, command=self.issue_tree.xview)
+        self.issue_tree.grid(row=0, column=0, sticky="nsew")
+        issue_y.grid(row=0, column=1, sticky="ns")
+        issue_x.grid(row=1, column=0, sticky="ew")
+        top.rowconfigure(0, weight=1)
+        top.columnconfigure(0, weight=1)
+        self.issue_tree.configure(yscrollcommand=issue_y.set, xscrollcommand=issue_x.set)
         self.issue_tree.bind("<<TreeviewSelect>>", lambda _event: self.on_issue_selected())
 
-        right = tk.Frame(paned, bg=BG)
-        paned.add(right, minsize=520)
-        self.detail_text = tk.Text(right, height=12, bg="#101720", fg=INK, insertbackground=INK, relief=tk.FLAT, wrap=tk.WORD)
-        self.detail_text.pack(fill=tk.BOTH, expand=True, padx=(8, 0), pady=(0, 8))
+        bottom = tk.Frame(paned, bg=BG)
+        paned.add(bottom, minsize=220, height=300)
+        bottom_header = tk.Frame(bottom, bg=BG)
+        bottom_header.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(bottom_header, textvariable=self.selected_summary_var, bg=BG, fg=MUTED, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.detail_toggle_button = self.button(bottom_header, "Show Details", self.toggle_detail_panel)
+        self.detail_toggle_button.pack(side=tk.RIGHT, padx=(8, 0))
+
+        self.detail_frame = tk.Frame(bottom, bg=BG)
+        self.detail_text = tk.Text(self.detail_frame, height=7, bg="#101720", fg=INK, insertbackground=INK, relief=tk.FLAT, wrap=tk.WORD)
+        detail_y = ttk.Scrollbar(self.detail_frame, orient=tk.VERTICAL, command=self.detail_text.yview)
+        self.detail_text.grid(row=0, column=0, sticky="nsew")
+        detail_y.grid(row=0, column=1, sticky="ns")
+        self.detail_frame.rowconfigure(0, weight=1)
+        self.detail_frame.columnconfigure(0, weight=1)
+        self.detail_text.configure(yscrollcommand=detail_y.set)
         self.detail_text.configure(state=tk.DISABLED)
 
         ev_columns = ("score", "audio", "ready", "type", "path", "locator")
-        self.evidence_tree = ttk.Treeview(right, columns=ev_columns, show="headings", selectmode="browse")
+        self.evidence_frame = tk.Frame(bottom, bg=BG)
+        self.evidence_frame.pack(fill=tk.BOTH, expand=True)
+        self.evidence_tree = ttk.Treeview(self.evidence_frame, columns=ev_columns, show="headings", selectmode="browse")
         ev_headings = {"score": "Match", "audio": "Audio", "ready": "Ready", "type": "Type", "path": "Doc", "locator": "Where"}
         ev_widths = {"score": 70, "audio": 70, "ready": 110, "type": 110, "path": 450, "locator": 170}
         for col in ev_columns:
             self.evidence_tree.heading(col, text=ev_headings[col])
             self.evidence_tree.column(col, width=ev_widths[col], anchor=tk.W)
-        self.evidence_tree.pack(fill=tk.BOTH, expand=True, padx=(8, 0))
+        evidence_y = ttk.Scrollbar(self.evidence_frame, orient=tk.VERTICAL, command=self.evidence_tree.yview)
+        evidence_x = ttk.Scrollbar(self.evidence_frame, orient=tk.HORIZONTAL, command=self.evidence_tree.xview)
+        self.evidence_tree.grid(row=0, column=0, sticky="nsew")
+        evidence_y.grid(row=0, column=1, sticky="ns")
+        evidence_x.grid(row=1, column=0, sticky="ew")
+        self.evidence_frame.rowconfigure(0, weight=1)
+        self.evidence_frame.columnconfigure(0, weight=1)
+        self.evidence_tree.configure(yscrollcommand=evidence_y.set, xscrollcommand=evidence_x.set)
         self.evidence_tree.bind("<Double-1>", lambda _event: self.open_selected_evidence())
 
         manual_panel = self.panel(self)
@@ -1985,6 +2015,23 @@ class TriageGui(tk.Tk):
 
         status = tk.Label(self, textvariable=self.status_var, bg=BG, fg=MUTED, anchor="w")
         status.pack(fill=tk.X, padx=16, pady=(0, 8))
+
+    def toggle_detail_panel(self) -> None:
+        if self.detail_frame is None:
+            return
+        if self.detail_visible_var.get():
+            self.detail_frame.pack_forget()
+            self.detail_visible_var.set(False)
+            if self.detail_toggle_button is not None:
+                self.detail_toggle_button.configure(text="Show Details")
+            return
+        pack_options = {"fill": tk.X, "pady": (0, 6)}
+        if self.evidence_frame is not None:
+            pack_options["before"] = self.evidence_frame
+        self.detail_frame.pack(**pack_options)
+        self.detail_visible_var.set(True)
+        if self.detail_toggle_button is not None:
+            self.detail_toggle_button.configure(text="Hide Details")
 
     def browse_design_root(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.design_root_var.get() or str(DEFAULT_DESIGN_ROOT), parent=self)
@@ -2820,6 +2867,20 @@ class TriageGui(tk.Tk):
 
     def show_issue_detail(self, issue: dict[str, Any]) -> None:
         evidence = issue.get("evidence") or []
+        self.selected_summary_var.set(
+            " | ".join(
+                part
+                for part in (
+                    f"{issue.get('key','')}: {issue.get('summary','')}",
+                    f"Status {issue.get('status','-')}",
+                    f"Reporter {issue.get('reporter','-')}",
+                    f"Creator {issue.get('creator','-')}",
+                    f"Design {issue.get('design_area','-')}",
+                    f"Dependency {issue.get('dependency_label','-')}",
+                )
+                if part.strip()
+            )[:900]
+        )
         lines = [
             f"Jira: {issue.get('key','')}  Source: {issue.get('source','')}",
             f"Summary: {issue.get('summary','')}",
