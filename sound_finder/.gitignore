@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local Sound Finder database and generated runtime artifacts.
+data/*.sqlite
+data/*.sqlite-*
+*.log
+*_stdout.log
+*_stderr.log
+
+# Visual slicer and diagnostic scratch output.
+codex_accessor_debug.txt
+codex_visual_events*.tsv
+codex_visual_peaks_debug.txt
+codex_visual_slice_report.txt
+
+# Screenshot verification artifacts.
+*.png

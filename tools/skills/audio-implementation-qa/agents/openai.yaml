@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audio Implementation QA"
+  short_description: "QA Wwise, Unity, mix, media, SoundBank, and source-control audio changes."
+  default_prompt: "QA these audio implementation changes, report risks with evidence, and recommend fixes without modifying anything."

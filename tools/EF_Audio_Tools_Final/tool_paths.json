@@ -1,0 +1,223 @@
+{
+  "folder_purpose": "Final user-facing launchers for EF audio tools. Original tools remain in their source folders.",
+  "gui_launcher": "Start_EF_Audio_Tools_GUI.cmd",
+  "menu_launcher": "Start_EF_Audio_Tools_Menu.cmd",
+  "tools": [
+    {
+      "menu": "1",
+      "name": "Sound Finder for Reaper",
+      "visible": true,
+      "launcher": "01_Sound_Finder_for_Reaper.cmd",
+      "source_launcher": "C:\\Users\\user1\\Documents\\Reaper\\Start_Sound_Finder.cmd",
+      "purpose": "Search local SFX libraries, preview audio, recommend layer combinations, and drag files into Reaper."
+    },
+    {
+      "menu": "2",
+      "name": "Unity/Wwise Log Monitor GUI",
+      "visible": true,
+      "launcher": "02_UnityWwise_Log_Monitor_GUI.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_UnityWwise_AudioLogMonitor_GUI.cmd",
+      "purpose": "Realtime Unity/Wwise audio log monitoring, issue screening, and analysis suggestions."
+    },
+    {
+      "menu": "3",
+      "name": "AI Work Impact Summary - Week",
+      "visible": false,
+      "hidden_reason": "Automatic or periodic report generator; keep out of the daily GUI.",
+      "launcher": "03_AI_Work_Impact_Week.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_AI_Work_Impact_Summary_Week.cmd",
+      "purpose": "Generate weekly AI-assisted work impact summary."
+    },
+    {
+      "menu": "4",
+      "name": "AI Work Impact Summary - Month",
+      "visible": false,
+      "hidden_reason": "Automatic or periodic report generator; keep out of the daily GUI.",
+      "launcher": "04_AI_Work_Impact_Month.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_AI_Work_Impact_Summary_Month.cmd",
+      "purpose": "Generate monthly AI-assisted work impact summary."
+    },
+    {
+      "menu": "5",
+      "name": "Audio Report Trend - Once",
+      "visible": false,
+      "hidden_reason": "Report aggregation tool; dashboard is the preferred visible entry.",
+      "launcher": "05_Audio_Report_Trend_Once.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioReportTrendMonitor_Once.cmd",
+      "purpose": "Aggregate recent audio reports and produce one trend summary."
+    },
+    {
+      "menu": "6",
+      "name": "ProjectEF Audio Report Dashboard",
+      "visible": true,
+      "launcher": "06_Open_Report_Dashboard.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\ProjectEF_reports_html\\index.html",
+      "purpose": "Open the local HTML report index."
+    },
+    {
+      "menu": "7",
+      "name": "ProjectEF Daily Audio Log Intelligence",
+      "visible": false,
+      "hidden_reason": "One-off report generator; hidden because the dashboard/log monitor are the daily visible entries.",
+      "launcher": "07_Daily_Log_Intelligence.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_DailyLogIntelligence_Once.cmd",
+      "purpose": "Analyze daily Unity/Wwise logs and reports into module, problem, runtime completion, and next-action summaries."
+    },
+    {
+      "menu": "8",
+      "name": "ProjectEF Wwise Template Generator",
+      "visible": true,
+      "launcher": "08_Wwise_Template_Generator.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_Wwise_Template_Generator_GUI.cmd",
+      "purpose": "Create Wwise object structures from approved templates through WAAPI, with dry-run, naming replacement, Event retargeting, and validation."
+    },
+    {
+      "menu": "9",
+      "name": "Audio Report Trend - Watch 3h",
+      "visible": false,
+      "hidden_reason": "Background/watch report process; keep out of the manual GUI.",
+      "launcher": "09_Audio_Report_Trend_Watch_3h.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioReportTrendMonitor_Watch_3h.cmd",
+      "purpose": "Run the audio report trend monitor in watch mode for 3 hours."
+    },
+    {
+      "menu": "10",
+      "name": "Runtime Audio Follow - Visible",
+      "visible": false,
+      "hidden_reason": "Legacy runtime monitor; superseded by Unity/Wwise Log Monitor GUI.",
+      "launcher": "10_Runtime_Audio_Follow_Visible.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_UnityWwise_RuntimeAudioFollow_Visible.cmd",
+      "purpose": "Start the legacy realtime Unity/Wwise runtime audio follow window."
+    },
+    {
+      "menu": "11",
+      "name": "Runtime Audio Follow - Minimized",
+      "visible": false,
+      "hidden_reason": "Legacy runtime monitor; superseded by Unity/Wwise Log Monitor GUI.",
+      "launcher": "11_Runtime_Audio_Follow_Minimized.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_UnityWwise_RuntimeAudioFollow_Minimized.cmd",
+      "purpose": "Start the legacy realtime Unity/Wwise runtime audio follow minimized."
+    },
+    {
+      "menu": "12",
+      "name": "Stop Runtime Audio Follow",
+      "visible": false,
+      "hidden_reason": "Legacy helper for hidden runtime monitor processes.",
+      "launcher": "12_Runtime_Audio_Follow_Stop.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Stop_ProjectEF_UnityWwise_RuntimeAudioFollow.cmd",
+      "purpose": "Stop legacy runtime audio follow processes."
+    },
+    {
+      "menu": "13",
+      "name": "Register Audio Trend Scheduled Task",
+      "visible": false,
+      "hidden_reason": "Scheduled-task maintenance tool.",
+      "launcher": "13_Register_Audio_Trend_Task.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Register_ProjectEF_AudioReportTrendMonitor_Task.ps1",
+      "purpose": "Register the periodic audio trend monitor scheduled task."
+    },
+    {
+      "menu": "14",
+      "name": "Unregister Audio Trend Scheduled Task",
+      "visible": false,
+      "hidden_reason": "Scheduled-task maintenance tool.",
+      "launcher": "14_Unregister_Audio_Trend_Task.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Unregister_ProjectEF_AudioReportTrendMonitor_Task.ps1",
+      "purpose": "Remove the periodic audio trend monitor scheduled task."
+    },
+    {
+      "menu": "15",
+      "name": "Register Daily Log Scheduled Task",
+      "visible": false,
+      "hidden_reason": "Scheduled-task maintenance tool.",
+      "launcher": "15_Register_Daily_Log_Task.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Register_ProjectEF_DailyLogIntelligence_Task.ps1",
+      "purpose": "Register the daily log intelligence scheduled task."
+    },
+    {
+      "menu": "16",
+      "name": "Unregister Daily Log Scheduled Task",
+      "visible": false,
+      "hidden_reason": "Scheduled-task maintenance tool.",
+      "launcher": "16_Unregister_Daily_Log_Task.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Unregister_ProjectEF_DailyLogIntelligence_Task.ps1",
+      "purpose": "Remove the daily log intelligence scheduled task."
+    },
+    {
+      "menu": "17",
+      "name": "Wwise Profiler Voice Capture",
+      "visible": true,
+      "launcher": "17_Wwise_Profiler_Voice_Capture.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_Wwise_ProfilerVoiceCapture.cmd",
+      "purpose": "Capture active Wwise Profiler voices, Unity starvation/underrun log findings, and machine metrics during a targeted Play Mode reproduction; duration and interval are configurable in the GUI."
+    },
+    {
+      "menu": "18",
+      "name": "P4V Audio Changelist Check",
+      "visible": false,
+      "hidden_reason": "Read-only report entry; superseded in the GUI by P4V Changelist Organizer.",
+      "launcher": "18_P4V_Audio_Changelist_Check.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_P4V_AudioChangelist_Check.cmd",
+      "purpose": "Analyze the current ProjectEF P4V changelist or local fallback changes, filter audio-related files, and flag SoundBank backups, generated files, cache, and source-audio submit risks."
+    },
+    {
+      "menu": "19",
+      "name": "P4V Changelist Organizer GUI",
+      "visible": true,
+      "launcher": "19_P4V_Changelist_Organizer_GUI.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_P4V_Changelist_Organizer_GUI.cmd",
+      "purpose": "GUI for filtering, labeling, learning, and locally reviewing ProjectEF audio-related pending files into P4 changelist groups. Supports task-goal memory, optional Ollama local AI review, selected-only moves, and creating one new pending changelist for selected rows; no revert/add/delete/submit."
+    },
+    {
+      "menu": "20",
+      "name": "UI Audio Static Inspector GUI",
+      "visible": true,
+      "launcher": "20_UIAudio_StaticInspector_GUI.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_UIAudio_StaticInspector_GUI.cmd",
+      "purpose": "Read-only static report GUI scanner for ProjectEF UI audio coverage across Unity prefabs/scenes, ButtonEx/ToggleEx defaults, ButtonAudioComp presets, UIStateOnClickSoundController state audio, prefab instance audio overrides, and Wwise Event validity."
+    },
+    {
+      "menu": "21",
+      "name": "Animation Wwise Event AutoConfig GUI",
+      "visible": true,
+      "launcher": "21_Animation_Wwise_Event_AutoConfig.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AnimationWwiseEvent_AutoConfig_GUI.cmd",
+      "purpose": "GUI for locating Unity .fbx/.anim clips and Wwise Events, previewing analyzed motion keyframes such as bird wing downstrokes, opening a Unity Editor preview window for actual prefab animation playback with markers, applying Animation Event configuration, and ensuring a generic receiver component exists without modifying WwiseAudioHelper."
+    },
+    {
+      "menu": "22",
+      "name": "Audio Requirement Jira Triage GUI",
+      "visible": true,
+      "launcher": "22_AudioRequirement_Jira_Triage_GUI.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioRequirementJiraTriage_GUI.cmd",
+      "purpose": "Read-only GUI for scanning ProjectEF design docs into versioned audio requirement evidence, matching Jira issues to exact design locations, judging whether audio work is needed or ready, and optionally using Ollama local AI for selected issue review. Does not modify Jira, Unity, Wwise, or P4."
+    },
+    {
+      "menu": "23",
+      "name": "Audio Requirement Scan Diff - Once",
+      "visible": false,
+      "hidden_reason": "Automation/periodic scan entry; the GUI is the preferred manual entry.",
+      "launcher": "23_AudioRequirement_ScanDiff_Once.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioRequirementJiraTriage_ScanDiff_Once.cmd",
+      "purpose": "Run one read-only design-doc scan, save a versioned snapshot, compare it with the previous index, and write audio requirement diff reports without opening the GUI. Does not modify Jira, Unity, Wwise, or P4."
+    },
+    {
+      "menu": "24",
+      "name": "Register Audio Requirement Scheduled Task",
+      "visible": false,
+      "hidden_reason": "Scheduled-task maintenance tool.",
+      "launcher": "24_Register_AudioRequirement_Task.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Register_ProjectEF_AudioRequirementJiraTriage_Task.ps1",
+      "purpose": "Register a daily Windows scheduled task that runs the read-only audio requirement scan/diff once per day. Does not modify Jira, Unity, Wwise, P4, or source documents."
+    },
+    {
+      "menu": "25",
+      "name": "Unregister Audio Requirement Scheduled Task",
+      "visible": false,
+      "hidden_reason": "Scheduled-task maintenance tool.",
+      "launcher": "25_Unregister_AudioRequirement_Task.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Unregister_ProjectEF_AudioRequirementJiraTriage_Task.ps1",
+      "purpose": "Remove the daily ProjectEF audio requirement scan/diff scheduled task."
+    }
+  ]
+}

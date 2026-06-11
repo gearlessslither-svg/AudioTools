@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unity Audio Integration Audit"
+  short_description: "Scan Unity for Wwise/audio events, trigger logic, references, and risks."
+  default_prompt: "Scan this Unity project for Wwise/audio integration, infer trigger logic, cross-check Wwise Events, and report risks."

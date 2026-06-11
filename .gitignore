@@ -1,0 +1,50 @@
+# AudioTools mirror repo — only curated source belongs here.
+# The sync engine already filters, but these guard against accidents.
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Large generated indexes / snapshots / databases
+*.sqlite
+*.sqlite-*
+audio_requirement_snapshots/
+audio_requirement_jira_index.json
+audio_requirement_design_diff_latest.json
+**/data/*.sqlite
+
+# Secrets / live configs (templates are committed instead)
+audio_requirement_jira_triage_config.json
+# Live browser profile (Jira tool) — login cookies/sessions, never commit
+jira_browser_profile/
+**/*browser_profile*/
+**/Cookies
+**/*cookie*
+**/*.secret
+id_rsa
+id_ed25519
+*.pem
+
+# Binaries / media / logs / screenshots
+*.exe
+*.dll
+*.wav
+*.flac
+*.aif
+*.aiff
+*.mp3
+*.ogg
+*.zip
+*.7z
+*.png
+*.jpg
+*.log
+*.tsv
+
+# Runtime / generated outputs
+handoff/
+reaper_projects/
+demo_library/
+GeneratedSoundBanks/

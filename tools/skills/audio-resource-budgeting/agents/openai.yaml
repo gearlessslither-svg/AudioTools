@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audio Resource Budgeting"
+  short_description: "Estimate audio asset counts, random samples, implementation steps, and schedule."
+  default_prompt: "Turn these audio requirements into a full resource budget, Wwise/Unity/mix steps, and time estimate."

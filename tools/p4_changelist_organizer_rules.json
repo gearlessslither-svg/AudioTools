@@ -1,0 +1,62 @@
+{
+  "profiles": {
+    "wwise": {
+      "root": "D:\\EF Wwise",
+      "depot_marker": "/ProjectEFAudio_Trunk/"
+    },
+    "unity": {
+      "root": "D:\\EF New\\Client\\TargetProject",
+      "depot_marker": ""
+    }
+  },
+  "rules": {
+    "include_keywords": [
+      "Wwise",
+      "Ak",
+      "Audio",
+      "Prefab",
+      "Manifest"
+    ],
+    "include_extensions": [
+      ".prefab",
+      ".asset",
+      ".unity",
+      ".cs",
+      ".meta",
+      ".json",
+      ".xml",
+      ".bytes",
+      ".bnk",
+      ".wem"
+    ],
+    "review_keywords": [
+      "ProjectSettings",
+      "Packages",
+      "Addressable",
+      "StreamingAssets",
+      "AssetBundle",
+      "Localization"
+    ],
+    "exclude_path_tokens": [
+      "Library",
+      "Temp",
+      "Logs",
+      "obj",
+      ".vs",
+      ".cursor",
+      "UserSettings",
+      "DerivedDataCache"
+    ],
+    "exclude_extensions": [
+      ".csproj",
+      ".sln",
+      ".user",
+      ".tmp",
+      ".log",
+      ".cache",
+      ".pidb",
+      ".booproj"
+    ],
+    "local_since": "2026-06-01"
+  }
+}

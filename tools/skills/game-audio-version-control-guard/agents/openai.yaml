@@ -1,0 +1,4 @@
+interface:
+  display_name: "Game Audio Version-Control Guard"
+  short_description: "Handle Unity/Wwise source-control decisions safely."
+  default_prompt: "Analyze this Unity/Wwise source-control situation and recommend the safe P4/Git action."

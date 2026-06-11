@@ -1,0 +1,10 @@
+# Normalize line endings so cross-platform edits don't churn the repo.
+* text=auto
+*.py text
+*.ps1 text
+*.cmd text
+*.md text
+*.json text
+*.yaml text
+*.yml text
+*.lua text

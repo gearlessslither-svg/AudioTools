@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unity Wwise Runtime Log Audit"
+  short_description: "Diagnose Wwise/Unity audio issues from Editor, Player, and build logs."
+  default_prompt: "Analyze these Unity/Wwise logs, identify audio-related abnormal behavior, infer causes, and recommend safe fixes."

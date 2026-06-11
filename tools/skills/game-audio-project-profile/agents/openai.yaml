@@ -1,0 +1,4 @@
+interface:
+  display_name: "Game Audio Project Profile"
+  short_description: "Build a reusable audio context profile for a game project."
+  default_prompt: "Create or refresh the audio project profile from docs, Wwise, Unity, source-control rules, and known risks."

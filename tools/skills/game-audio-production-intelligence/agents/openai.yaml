@@ -1,0 +1,4 @@
+interface:
+  display_name: "Game Audio Production Intelligence"
+  short_description: "Turn project docs, tasks, Wwise, and Unity state into audio plans, readiness checks, and QA."
+  default_prompt: "Scan the project context, mine audio requirements, challenge risks, judge readiness, and propose the next audio-production actions."

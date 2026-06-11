@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audio Readiness And Change Monitor"
+  short_description: "Gate audio readiness and monitor upstream changes for rework risk."
+  default_prompt: "Compare the current project state with prior audio requirements and report readiness, blockers, and change impact."

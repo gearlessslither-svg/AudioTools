@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audio Requirement Mining"
+  short_description: "Turn design docs and tasks into prioritized audio requirement candidates."
+  default_prompt: "Scan these documents and produce an audio requirement map with SABC priority, dependencies, risks, and questions."
