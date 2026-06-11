@@ -218,6 +218,14 @@
       "launcher": "25_Unregister_AudioRequirement_Task.cmd",
       "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Unregister_ProjectEF_AudioRequirementJiraTriage_Task.ps1",
       "purpose": "Remove the daily ProjectEF audio requirement scan/diff scheduled task."
+    },
+    {
+      "menu": "26",
+      "name": "AudioTools Git Sync GUI",
+      "visible": true,
+      "launcher": "26_AudioTools_Git_Sync.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioTools_GitSync_GUI.cmd",
+      "purpose": "Mirror EdgeFlow/ProjectEF audio tool source + Sound Finder into the private Git repo, run a safety scan (excludes indexes, DBs, media, browser cookies, secrets), commit locally, and push to GitHub on explicit confirmation."
     }
   ]
 }

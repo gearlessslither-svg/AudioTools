@@ -76,7 +76,7 @@ DEFAULT_JIRA_URL = "http://ef.jira.blackjack-local.com:8080"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_LOCAL_MODEL = "qwen2.5:7b-instruct"
 INDEX_VERSION = 1
-JIRA_SEARCH_FIELDS = "summary,description,status,assignee,updated,fixVersions,versions,components,labels,issuetype,priority,project,issuelinks"
+JIRA_SEARCH_FIELDS = "summary,description,status,assignee,reporter,creator,updated,fixVersions,versions,components,labels,issuetype,priority,project,issuelinks"
 
 TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".html", ".htm"}
 TABLE_EXTENSIONS = {".xlsx"}
@@ -1595,6 +1595,8 @@ def parse_issue_from_json(data: dict[str, Any]) -> dict[str, Any]:
         "description": strip_html(str(description)),
         "status": ((fields.get("status") or {}).get("name") if isinstance(fields.get("status"), dict) else ""),
         "assignee": ((fields.get("assignee") or {}).get("displayName") if isinstance(fields.get("assignee"), dict) else ""),
+        "reporter": ((fields.get("reporter") or {}).get("displayName") if isinstance(fields.get("reporter"), dict) else ""),
+        "creator": ((fields.get("creator") or {}).get("displayName") if isinstance(fields.get("creator"), dict) else ""),
         "updated": fields.get("updated", ""),
         "project": ((fields.get("project") or {}).get("key") if isinstance(fields.get("project"), dict) else ""),
         "issue_type": ((fields.get("issuetype") or {}).get("name") if isinstance(fields.get("issuetype"), dict) else ""),
@@ -1684,6 +1686,8 @@ def parse_issue_from_csv_row(row: dict[str, str], fallback_index: int) -> dict[s
     description = csv_value(row, ["Description", "描述", "说明"])
     status = csv_value(row, ["Status", "状态"])
     assignee = csv_value(row, ["Assignee", "经办人", "负责人", "处理人"])
+    reporter = csv_value(row, ["Reporter", "报告人", "发起人", "提出人"])
+    creator = csv_value(row, ["Creator", "创建人", "创建者"])
     updated = csv_value(row, ["Updated", "更新日期", "已更新", "更新时间"])
     if not key:
         key = f"CSV-{fallback_index}"
@@ -1695,6 +1699,8 @@ def parse_issue_from_csv_row(row: dict[str, str], fallback_index: int) -> dict[s
         "description": description,
         "status": status,
         "assignee": assignee,
+        "reporter": reporter,
+        "creator": creator,
         "updated": updated,
         "project": csv_value(row, ["Project key", "Project", "项目"]),
         "issue_type": csv_value(row, ["Issue Type", "Issue type", "类型", "问题类型"]),
@@ -1749,6 +1755,8 @@ class TriageGui(tk.Tk):
         self.filter_status_var = tk.StringVar(value="All")
         self.filter_type_var = tk.StringVar(value="All")
         self.filter_assignee_var = tk.StringVar(value="All")
+        self.filter_reporter_var = tk.StringVar(value="All")
+        self.filter_creator_var = tk.StringVar(value="All")
         self.filter_priority_var = tk.StringVar(value="All")
         self.filter_design_area_var = tk.StringVar(value="All")
         self.filter_design_doc_var = tk.StringVar(value="All")
@@ -1900,12 +1908,14 @@ class TriageGui(tk.Tk):
         self.add_filter_combo(filter_grid, 0, 5, "Status", self.filter_status_var, 12)
         self.add_filter_combo(filter_grid, 0, 6, "Type", self.filter_type_var, 14)
         self.add_filter_combo(filter_grid, 0, 7, "Assignee", self.filter_assignee_var, 16)
-        self.add_filter_combo(filter_grid, 1, 0, "Priority", self.filter_priority_var, 12)
-        self.add_filter_combo(filter_grid, 1, 1, "Design Area", self.filter_design_area_var, 24)
-        self.add_filter_combo(filter_grid, 1, 2, "Design Doc", self.filter_design_doc_var, 34)
-        self.add_filter_combo(filter_grid, 1, 3, "Dependency", self.filter_dependency_var, 24)
-        self.add_filter_combo(filter_grid, 1, 4, "Component", self.filter_component_var, 18)
-        self.add_filter_combo(filter_grid, 1, 5, "Label", self.filter_label_var, 18)
+        self.add_filter_combo(filter_grid, 0, 8, "Reporter", self.filter_reporter_var, 16)
+        self.add_filter_combo(filter_grid, 1, 0, "Creator", self.filter_creator_var, 16)
+        self.add_filter_combo(filter_grid, 1, 1, "Priority", self.filter_priority_var, 12)
+        self.add_filter_combo(filter_grid, 1, 2, "Design Area", self.filter_design_area_var, 24)
+        self.add_filter_combo(filter_grid, 1, 3, "Design Doc", self.filter_design_doc_var, 34)
+        self.add_filter_combo(filter_grid, 1, 4, "Dependency", self.filter_dependency_var, 24)
+        self.add_filter_combo(filter_grid, 1, 5, "Component", self.filter_component_var, 18)
+        self.add_filter_combo(filter_grid, 1, 6, "Label", self.filter_label_var, 18)
 
         paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=BG, sashwidth=6)
         paned.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
@@ -2314,6 +2324,8 @@ class TriageGui(tk.Tk):
         set_combo(self.filter_combos.get("Status"), self.filter_status_var, collect("status"))
         set_combo(self.filter_combos.get("Type"), self.filter_type_var, collect("issue_type"))
         set_combo(self.filter_combos.get("Assignee"), self.filter_assignee_var, collect("assignee"))
+        set_combo(self.filter_combos.get("Reporter"), self.filter_reporter_var, collect("reporter"))
+        set_combo(self.filter_combos.get("Creator"), self.filter_creator_var, collect("creator"))
         set_combo(self.filter_combos.get("Priority"), self.filter_priority_var, collect("priority"))
         set_combo(self.filter_combos.get("Design Area"), self.filter_design_area_var, collect("design_area"))
         set_combo(self.filter_combos.get("Design Doc"), self.filter_design_doc_var, collect("design_doc"))
@@ -2332,6 +2344,8 @@ class TriageGui(tk.Tk):
             self.filter_status_var,
             self.filter_type_var,
             self.filter_assignee_var,
+            self.filter_reporter_var,
+            self.filter_creator_var,
             self.filter_priority_var,
             self.filter_design_area_var,
             self.filter_design_doc_var,
@@ -2660,6 +2674,8 @@ class TriageGui(tk.Tk):
         issue.setdefault("ready_state", "Unknown")
         issue.setdefault("sound_type", "")
         issue.setdefault("issue_links", "")
+        issue.setdefault("reporter", "")
+        issue.setdefault("creator", "")
         for idx, existing in enumerate(self.issues):
             if existing.get("id") == issue["id"]:
                 self.issues[idx] = issue
@@ -2721,6 +2737,8 @@ class TriageGui(tk.Tk):
                     "dependency_label",
                     "status",
                     "assignee",
+                    "reporter",
+                    "creator",
                     "issue_type",
                     "priority",
                     "components",
@@ -2746,6 +2764,10 @@ class TriageGui(tk.Tk):
             if not matches_filter(issue, "issue_type", selected(self.filter_type_var)):
                 continue
             if not matches_filter(issue, "assignee", selected(self.filter_assignee_var)):
+                continue
+            if not matches_filter(issue, "reporter", selected(self.filter_reporter_var)):
+                continue
+            if not matches_filter(issue, "creator", selected(self.filter_creator_var)):
                 continue
             if not matches_filter(issue, "priority", selected(self.filter_priority_var)):
                 continue
@@ -2801,9 +2823,11 @@ class TriageGui(tk.Tk):
         lines = [
             f"Jira: {issue.get('key','')}  Source: {issue.get('source','')}",
             f"Summary: {issue.get('summary','')}",
-            f"Status: {issue.get('status','-')}  Assignee: {issue.get('assignee','-')}  Updated: {issue.get('updated','-')}",
-            f"Version: {issue.get('version_label','-')}  Component: {issue.get('components','-')}  Type: {issue.get('issue_type','-')}  Priority: {issue.get('priority','-')}",
-            f"Design Area: {issue.get('design_area','-')}  System: {issue.get('system','-')}  Sound Type: {issue.get('sound_type','-')}  Can Start: {issue.get('can_start','-')}",
+            f"Status: {issue.get('status','-')}  Assignee: {issue.get('assignee','-')}  Reporter: {issue.get('reporter','-')}  Creator: {issue.get('creator','-')}  Updated: {issue.get('updated','-')}",
+            f"Version: {issue.get('version_label','-')}  Component: {issue.get('components','-')}  Label: {issue.get('labels','-')}",
+            f"Type: {issue.get('issue_type','-')}  Priority: {issue.get('priority','-')}  Dependency: {issue.get('dependency_label','-')}",
+            f"Design Area: {issue.get('design_area','-')}  Design Doc: {issue.get('design_doc','-')}",
+            f"System: {issue.get('system','-')}  Sound Type: {issue.get('sound_type','-')}  Can Start: {issue.get('can_start','-')}",
             f"Audio Required: {issue.get('audio_required','-')}  Ready: {issue.get('ready_state','-')}  Confidence: {issue.get('confidence','-')}",
             f"Reason: {issue.get('reason','-')}",
             "",
@@ -2899,12 +2923,18 @@ class TriageGui(tk.Tk):
             "ready_state",
             "system",
             "design_area",
+            "design_doc",
+            "dependency_label",
             "version",
             "sound_type",
             "confidence",
             "status",
             "assignee",
+            "reporter",
+            "creator",
             "components",
+            "labels",
+            "issue_links",
             "issue_type",
             "priority",
             "reason",
@@ -2926,12 +2956,18 @@ class TriageGui(tk.Tk):
                     "ready_state": issue.get("ready_state", ""),
                     "system": issue.get("system", ""),
                     "design_area": issue.get("design_area", ""),
+                    "design_doc": issue.get("design_doc", ""),
+                    "dependency_label": issue.get("dependency_label", ""),
                     "version": issue.get("version_label", ""),
                     "sound_type": issue.get("sound_type", ""),
                     "confidence": issue.get("confidence", ""),
                     "status": issue.get("status", ""),
                     "assignee": issue.get("assignee", ""),
+                    "reporter": issue.get("reporter", ""),
+                    "creator": issue.get("creator", ""),
                     "components": issue.get("components", ""),
+                    "labels": issue.get("labels", ""),
+                    "issue_links": issue.get("issue_links", ""),
                     "issue_type": issue.get("issue_type", ""),
                     "priority": issue.get("priority", ""),
                     "reason": issue.get("reason", ""),
@@ -2947,8 +2983,8 @@ class TriageGui(tk.Tk):
             f"- Index: `{INDEX_PATH}`",
             f"- Issues: {len(self.issues)}",
             "",
-            "| Jira | Audio? | Start? | Ready | System | Version | Confidence | Summary | Best Evidence |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| Jira | Audio? | Start? | Ready | System | Version | Design | Dependency | Confidence | Summary | Best Evidence |",
+            "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for issue in self.issues:
             evidence = issue.get("evidence") or []
@@ -2965,6 +3001,8 @@ class TriageGui(tk.Tk):
                         issue.get("ready_state", ""),
                         issue.get("system", ""),
                         issue.get("version_label", ""),
+                        issue.get("design_area", ""),
+                        issue.get("dependency_label", ""),
                         issue.get("confidence", ""),
                         issue.get("summary", ""),
                         best_label,
@@ -2978,8 +3016,10 @@ class TriageGui(tk.Tk):
             lines.append(f"- Audio Required: {issue.get('audio_required','')}")
             lines.append(f"- Can Start: {issue.get('can_start','')}")
             lines.append(f"- Ready State: {issue.get('ready_state','')}")
-            lines.append(f"- System: {issue.get('system','')} | Design Area: {issue.get('design_area','')} | Version: {issue.get('version_label','')}")
-            lines.append(f"- Jira Status: {issue.get('status','')} | Assignee: {issue.get('assignee','')} | Component: {issue.get('components','')}")
+            lines.append(f"- System: {issue.get('system','')} | Design Area: {issue.get('design_area','')} | Design Doc: {issue.get('design_doc','')} | Version: {issue.get('version_label','')}")
+            lines.append(f"- Dependency: {issue.get('dependency_label','')} | Links: {issue.get('issue_links','')}")
+            lines.append(f"- Jira Status: {issue.get('status','')} | Assignee: {issue.get('assignee','')} | Reporter: {issue.get('reporter','')} | Creator: {issue.get('creator','')}")
+            lines.append(f"- Component: {issue.get('components','')} | Labels: {issue.get('labels','')}")
             lines.append(f"- Reason: {issue.get('reason','')}")
             for item in (issue.get("evidence") or [])[:5]:
                 snippet = (item.get("evidence") or item.get("text") or "").replace("\n", " ")[:300]
