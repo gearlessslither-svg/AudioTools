@@ -1187,9 +1187,13 @@ def cdp_is_available() -> bool:
 
 
 def start_dedicated_jira_browser(base_url: str, jql: str = "") -> None:
+    url = jira_issue_navigator_url(base_url, jql)
+    start_dedicated_jira_browser_url(url)
+
+
+def start_dedicated_jira_browser_url(url: str) -> None:
     DEDICATED_JIRA_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     edge = find_edge_executable()
-    url = jira_issue_navigator_url(base_url, jql)
     args = [
         edge,
         f"--user-data-dir={DEDICATED_JIRA_PROFILE_DIR}",
@@ -1969,6 +1973,7 @@ class TriageGui(tk.Tk):
         top.columnconfigure(0, weight=1)
         self.issue_tree.configure(yscrollcommand=issue_y.set, xscrollcommand=issue_x.set)
         self.issue_tree.bind("<<TreeviewSelect>>", lambda _event: self.on_issue_selected())
+        self.issue_tree.bind("<Double-1>", lambda _event: self.open_selected_jira_issue())
 
         bottom = tk.Frame(paned, bg=BG)
         paned.add(bottom, minsize=220, height=300)
@@ -2864,6 +2869,31 @@ class TriageGui(tk.Tk):
         issue = selected[0]
         self.show_issue_detail(issue)
         self.refresh_evidence_table(issue)
+
+    def open_selected_jira_issue(self) -> None:
+        selected = self.selected_issues()
+        if not selected:
+            return
+        issue = selected[0]
+        key = str(issue.get("key") or issue.get("id") or "").strip()
+        url = str(issue.get("url") or "").strip()
+        if not url and key:
+            url = f"{(self.jira_url_var.get().strip() or DEFAULT_JIRA_URL).rstrip('/')}/browse/{urllib.parse.quote(key)}"
+        if not url:
+            messagebox.showinfo("Open Jira", "Selected row has no Jira URL or key.")
+            return
+        try:
+            if cdp_is_available():
+                cdp_new_tab(url)
+            else:
+                start_dedicated_jira_browser_url(url)
+            self.status_var.set(f"Opened Jira issue: {url}")
+        except Exception as exc:
+            try:
+                os.startfile(url)
+                self.status_var.set(f"Opened Jira issue in default browser: {url}")
+            except Exception:
+                messagebox.showerror("Open Jira", f"Could not open Jira issue:\n{url}\n\n{exc}"[:4000])
 
     def show_issue_detail(self, issue: dict[str, Any]) -> None:
         evidence = issue.get("evidence") or []
