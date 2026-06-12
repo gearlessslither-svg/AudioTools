@@ -226,6 +226,22 @@
       "launcher": "26_AudioTools_Git_Sync.cmd",
       "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioTools_GitSync_GUI.cmd",
       "purpose": "Mirror EdgeFlow/ProjectEF audio tool source + Sound Finder into the private Git repo, run a safety scan (excludes indexes, DBs, media, browser cookies, secrets), commit locally, and push to GitHub on explicit confirmation."
+    },
+    {
+      "menu": "27",
+      "name": "Wwise Audio Logic Tester (LLM Sound Caster)",
+      "visible": true,
+      "launcher": "27_Wwise_AudioLogicTester_GUI.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_Wwise_AudioLogicTester_GUI.cmd",
+      "purpose": "Describe a complex audio test in natural language; an LLM (local Ollama or remote GPT/Claude) converts it into a DSL grounded in the project’s real Events/RTPCs/States/Switches; a WAAPI ak.soundengine engine runs it against the open Wwise Authoring instance (post events, timed RTPC ramps, conditional triggers on RTPC crossings, states/switches, loops, parallel) with no game build."
+    },
+    {
+      "menu": "28",
+      "name": "ProjectEF Audio Debug Assistant",
+      "visible": true,
+      "launcher": "28_Audio_Debug_Assistant.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_Audio_Debug_Assistant.cmd",
+      "purpose": "Scenario-level Wwise and Unity/Wwise debug assistant. Type an Event, Wwise node, or issue description; it runs read-only Wwise local checks with WAAPI/Profiler and reuses the Unity/Wwise log monitor rules for game integration diagnosis."
     }
   ]
 }

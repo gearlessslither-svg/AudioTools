@@ -1199,6 +1199,7 @@ def start_dedicated_jira_browser_url(url: str) -> None:
         f"--user-data-dir={DEDICATED_JIRA_PROFILE_DIR}",
         f"--remote-debugging-port={JIRA_CDP_PORT}",
         "--remote-debugging-address=127.0.0.1",
+        "--no-proxy-server",
         "--no-first-run",
         "--no-default-browser-check",
         "--new-window",
@@ -1871,6 +1872,7 @@ class TriageGui(tk.Tk):
         self.entry(jira_panel, "Issue Key", self.issue_key_var, 120).pack(side=tk.LEFT, padx=8, pady=10)
         self.button(jira_panel, "Test Jira", self.test_jira).pack(side=tk.LEFT, padx=4)
         self.button(jira_panel, "Open Dedicated Jira", self.open_dedicated_jira_browser_clicked, bg="#315577").pack(side=tk.LEFT, padx=4)
+        self.button(jira_panel, "Restart Dedicated Jira", self.restart_dedicated_jira_browser_clicked, bg="#315577").pack(side=tk.LEFT, padx=4)
         self.button(jira_panel, "Use Browser Login", self.use_browser_login_clicked).pack(side=tk.LEFT, padx=4)
         self.button(jira_panel, "Close Edge + Login", self.close_edge_then_login_clicked, bg="#8d5f32").pack(side=tk.LEFT, padx=4)
         self.button(jira_panel, "Sync Issue", self.sync_issue_clicked).pack(side=tk.LEFT, padx=4)
@@ -2134,6 +2136,12 @@ class TriageGui(tk.Tk):
         self.normalize_jql_from_url_if_needed()
         self.open_dedicated_jira_browser(show_message=True)
 
+    def restart_dedicated_jira_browser_clicked(self) -> None:
+        self.normalize_jql_from_url_if_needed()
+        self.close_dedicated_jira_browser_processes()
+        time.sleep(1.0)
+        self.open_dedicated_jira_browser(show_message=True)
+
     def open_dedicated_jira_browser(self, show_message: bool = False) -> None:
         base = self.jira_url_var.get().strip() or DEFAULT_JIRA_URL
         jql = self.jql_var.get().strip()
@@ -2156,6 +2164,21 @@ class TriageGui(tk.Tk):
                 "Log into Jira in that window once. After that, click One Click Refresh Jira.\n\n"
                 f"Profile:\n{DEDICATED_JIRA_PROFILE_DIR}",
             )
+
+    def close_dedicated_jira_browser_processes(self) -> None:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        command = (
+            "Get-CimInstance Win32_Process -Filter \"name = 'msedge.exe'\" | "
+            "Where-Object { $_.CommandLine -like '*jira_browser_profile*' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+            creationflags=flags,
+            timeout=10,
+        )
 
     def sync_jql_via_dedicated_browser(self, open_if_missing: bool = False) -> bool:
         base = self.jira_url_var.get().strip() or DEFAULT_JIRA_URL

@@ -22,6 +22,11 @@ if ($CurrentHash -ne $InstalledHash) {
     }
 }
 
+if ($args -contains "--obs-reaper-bridge") {
+    & $Python (Join-Path $Root "tools\obs_reaper_bridge.py")
+    exit $LASTEXITCODE
+}
+
 $env:PYTHONPATH = Join-Path $Root "src"
 & $Python -m sound_finder @args
 exit $LASTEXITCODE

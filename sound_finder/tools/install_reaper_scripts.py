@@ -12,6 +12,7 @@ SCRIPT_NAMES = [
     "Codex_Enable auto-crossfade media items when editing.lua",
     "Codex_Visual slicer for selected item via source file.lua",
     "Codex_Visual slicer preset settings.lua",
+    "Codex_OBS ReaStream capture setup.lua",
     "codex_visual_event_analyzer.py",
 ]
 

@@ -18,6 +18,7 @@ echo 6. P4V Changelist Organizer GUI
 echo 7. UI Audio Static Inspector GUI
 echo 8. Animation Wwise Event AutoConfig GUI
 echo 9. Audio Requirement Jira Triage GUI
+echo 10. Audio Debug Assistant
 echo.
 echo A. Advanced / hidden report and maintenance tools
 echo Q. Quit
@@ -33,6 +34,7 @@ if /I "%CHOICE%"=="6" call "%~dp0\19_P4V_Changelist_Organizer_GUI.cmd" & goto me
 if /I "%CHOICE%"=="7" call "%~dp0\20_UIAudio_StaticInspector_GUI.cmd" & goto menu
 if /I "%CHOICE%"=="8" call "%~dp0\21_Animation_Wwise_Event_AutoConfig.cmd" & goto menu
 if /I "%CHOICE%"=="9" call "%~dp0\22_AudioRequirement_Jira_Triage_GUI.cmd" & goto menu
+if /I "%CHOICE%"=="10" call "%~dp0\28_Audio_Debug_Assistant.cmd" & goto menu
 if /I "%CHOICE%"=="A" goto advanced
 if /I "%CHOICE%"=="Q" exit /b 0
 

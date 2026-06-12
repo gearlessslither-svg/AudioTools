@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import socket
@@ -655,6 +656,15 @@ class WaapiTemplateExecutor:
             raise ValueError("新名称不能为空。")
         if not target_parent_path:
             raise ValueError("目标父级路径不能为空。")
+
+        # WaapiClient.__init__ calls asyncio.get_event_loop(), which raises
+        # "There is no current event loop in thread ..." on Python 3.12+ when run
+        # from a worker thread (this method runs off the Tk main thread). Ensure
+        # this thread has an event loop before connecting.
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
 
         with self.WaapiClient(url=self.url) as client:
             self.client = client
@@ -1740,12 +1750,16 @@ class WwiseTemplateApp(tk.Tk):
                 self.after(0, lambda: self._execute_done(log, None, bool(args["save_project"])))
             except Exception as exc:
                 tb = traceback.format_exc()
+                # Keep a reference: Python 3 deletes the `exc` name when the except
+                # block exits, but self.after runs the lambda later. Bind via default
+                # args so the completion callback (and UI unlock) always fires.
+                err = exc
                 log = list(getattr(exc, "log", []) or [])
                 if log:
                     log.extend(["", "Traceback:", tb])
                 else:
                     log = [tb]
-                self.after(0, lambda: self._execute_done(log, exc, False))
+                self.after(0, lambda log=log, err=err: self._execute_done(log, err, False))
 
         threading.Thread(target=worker, daemon=True).start()
 

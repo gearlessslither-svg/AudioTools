@@ -132,6 +132,40 @@ and creates Random or Switch Containers in Wwise through ReaWwise/WAAPI. For
 Switch Containers, click `Connect / Refresh Wwise`, choose a Switch/State Group,
 then review the per-child assignments before starting the export/import.
 
+## OBS / REAPER Capture Bridge
+
+Launch the OBS/Reaper bridge GUI:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 --obs-reaper-bridge
+```
+
+Or double-click:
+
+```text
+Start_OBS_Reaper_Bridge.cmd
+```
+
+Recommended signal path for this workstation:
+
+```text
+REAPER Master ReaStream Send -> OBS ReaStream VST Receive -> OBS Record
+```
+
+Why this route: this REAPER install uses an ASIO device, so OBS desktop audio
+capture may not hear REAPER directly. The bridge checks OBS, REAPER, ReaStream,
+and obs-websocket, can enable the OBS WebSocket config, installs
+`Codex_OBS ReaStream capture setup.lua`, then uses OBS WebSocket to start/stop
+recording.
+
+First-time REAPER setup:
+
+1. Run `tools\install_reaper_scripts.py`, or click `安装 REAPER 路由脚本` in the bridge GUI.
+2. In REAPER, run `Codex_OBS ReaStream capture setup.lua` from the Action List.
+3. In the opened Master ReaStream window, choose `Send audio/MIDI`, use identifier `Codex_OBS`, and choose local broadcast.
+4. In OBS, the ReaStream VST filter should be set to `Receive audio/MIDI` with the same identifier.
+5. Click `一键抓取` in the bridge GUI to launch/connect OBS and start recording.
+
 ## Maintenance
 
 Show database size, row counts, indexes, settings, and current library count:
