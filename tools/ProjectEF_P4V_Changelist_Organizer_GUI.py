@@ -48,6 +48,10 @@ INK = "#edf4ff"
 MUTED = "#9fb0c6"
 LINE = "#334258"
 WARN = "#ffcc66"
+AUDIO_HIGHLIGHT_BG = "#6e161b"
+AUDIO_HIGHLIGHT_FG = "#fff4f4"
+AUDIO_FILTER_BG = "#c24132"
+AUDIO_FILTER_ACTIVE = "#ef6a5b"
 
 DECISIONS = ["KEEP", "REVIEW", "EXCLUDE", "GENERATED_REVIEW"]
 DECISION_META = {
@@ -483,6 +487,19 @@ def marker_list(profile: RepoProfile, ui_marker: str) -> list[str]:
     return markers
 
 
+def p4_history_scopes(profile: RepoProfile, root: Path, ui_marker: str) -> list[str | Path]:
+    scopes: list[str | Path] = [root]
+    for marker in marker_list(profile, ui_marker):
+        marker_norm = normalize_path_text(marker).strip("/")
+        if marker_norm:
+            depot_scope = f"//.../{marker_norm}/..."
+            if depot_scope not in scopes:
+                scopes.append(depot_scope)
+    if "//..." not in scopes:
+        scopes.append("//...")
+    return scopes
+
+
 def depot_to_local(depot_path: str, root: Path, profile: RepoProfile, ui_marker: str) -> tuple[Path | None, str]:
     normalized = normalize_path_text(depot_path)
     for marker in marker_list(profile, ui_marker):
@@ -546,6 +563,40 @@ class P4Client:
             if parsed:
                 entries.append(parsed)
         return True, f"Loaded {len(entries)} opened files from P4 for {root}.", entries
+
+    def submitted_changes(self, scope: str | Path, max_count: int = 120) -> list[dict[str, str]]:
+        path_arg = str(scope / "...") if isinstance(scope, Path) else scope
+        proc = self.run(
+            ["changes", "-s", "submitted", "-u", self.user, "-m", str(max_count), path_arg],
+            timeout=max(self.timeout, 45),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "p4 changes failed").strip())
+        changes: list[dict[str, str]] = []
+        for line in proc.stdout.splitlines():
+            match = re.match(r"^Change\s+(\d+)\s+on\s+(\S+)\s+by\s+(\S+)\s+'(.*)'$", line.strip())
+            if not match:
+                continue
+            changes.append(
+                {
+                    "change": match.group(1),
+                    "date": match.group(2),
+                    "owner": match.group(3),
+                    "summary": match.group(4),
+                }
+            )
+        return changes
+
+    def describe_change_files(self, changelist: str) -> list[dict[str, str]]:
+        proc = self.run(["describe", "-s", changelist], timeout=max(self.timeout, 30))
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or f"p4 describe {changelist} failed").strip())
+        files: list[dict[str, str]] = []
+        for line in proc.stdout.splitlines():
+            match = re.match(r"^\.\.\.\s+(//.+?)#\d+\s+(\w+)", line.strip())
+            if match:
+                files.append({"depot": match.group(1), "action": match.group(2)})
+        return files
 
     def reopen(self, changelist: str, files: list[str]) -> tuple[int, list[str]]:
         errors: list[str] = []
@@ -1144,6 +1195,8 @@ class OrganizerGui(tk.Tk):
         task_goal.pack(side=tk.LEFT, padx=(0, 10), ipady=4)
         self.button(learning_top, "Apply Learned", self.apply_learned_marks).pack(side=tk.LEFT, padx=4)
         self.button(learning_top, "Learn From Marks", self.learn_from_selected).pack(side=tk.LEFT, padx=4)
+        self.history_learn_button = self.button(learning_top, "Learn History", self.learn_from_p4_history, bg="#344966")
+        self.history_learn_button.pack(side=tk.LEFT, padx=4)
         self.button(learning_top, "Open Memory", self.open_learning_memory).pack(side=tk.LEFT, padx=4)
         tk.Label(
             learning_top,
@@ -1180,7 +1233,7 @@ class OrganizerGui(tk.Tk):
         combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_table())
         tk.Checkbutton(
             toolbar,
-            text="Audio Only",
+            text="Audio Only (filter)",
             variable=self.audio_only_var,
             command=self.refresh_table,
             bg=PANEL,
@@ -1190,6 +1243,15 @@ class OrganizerGui(tk.Tk):
             activeforeground=INK,
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT, padx=(0, 10))
+        self.button(
+            toolbar,
+            "Only Audio Changes",
+            self.show_audio_only,
+            bg=AUDIO_FILTER_BG,
+            fg="#ffffff",
+            active_bg=AUDIO_FILTER_ACTIVE,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        self.button(toolbar, "Show All", self.show_all_rows, bg=CARD).pack(side=tk.LEFT, padx=(0, 10))
         tk.Checkbutton(
             toolbar,
             text="Include Local Scan",
@@ -1293,6 +1355,8 @@ class OrganizerGui(tk.Tk):
         self.tree.tag_configure("review", background="#24210f")
         self.tree.tag_configure("exclude", background="#2a1518")
         self.tree.tag_configure("generated", background="#1b2035")
+        for decision_tag in ("keep", "review", "exclude", "generated"):
+            self.tree.tag_configure(f"audio_{decision_tag}", background=AUDIO_HIGHLIGHT_BG, foreground=AUDIO_HIGHLIGHT_FG)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         yscroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
         yscroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1344,6 +1408,7 @@ class OrganizerGui(tk.Tk):
             getattr(self, "selected_new_cl_button", None),
             getattr(self, "visible_audio_new_cl_button", None),
             getattr(self, "apply_moves_button", None),
+            getattr(self, "history_learn_button", None),
         ]
         if busy:
             self.scan_button.configure(text="Scanning...", state=tk.DISABLED)
@@ -1369,6 +1434,7 @@ class OrganizerGui(tk.Tk):
             getattr(self, "selected_new_cl_button", None),
             getattr(self, "visible_audio_new_cl_button", None),
             getattr(self, "apply_moves_button", None),
+            getattr(self, "history_learn_button", None),
         ]
         if busy:
             self._p4_operation_running = True
@@ -1549,6 +1615,234 @@ class OrganizerGui(tk.Tk):
             "This only updates the local organizer memory. It does not touch P4 or project files.",
         )
 
+    def history_row_to_learning_example(
+        self,
+        row: dict[str, Any],
+        profile: RepoProfile,
+        change: dict[str, str],
+        sibling: bool = False,
+    ) -> dict[str, Any]:
+        summary = str(change.get("summary") or "")
+        task_goal = f"p4-history {change.get('change', '-')}: {summary}"
+        decision = category_to_decision(str(row.get("category", "")))
+        if "GENERATED_BANK" in str(row.get("category", "")).upper():
+            decision = "GENERATED_REVIEW"
+        if sibling:
+            decision = "REVIEW"
+        return {
+            "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "source": "p4-history-audio-sibling" if sibling else "p4-history",
+            "change": change.get("change", ""),
+            "change_date": change.get("date", ""),
+            "change_owner": change.get("owner", ""),
+            "task_goal": task_goal,
+            "task_tokens": sorted(text_tokens(task_goal)),
+            "repo_kind": profile.key,
+            "repo": row.get("repo", profile.name),
+            "rel_path": row.get("rel_path", ""),
+            "path_tokens": sorted(text_tokens(str(row.get("rel_path", "")))),
+            "extension": row.get("extension", ""),
+            "category": row.get("category", ""),
+            "decision": normalized_decision(decision),
+            "p4_action": row.get("p4_action", ""),
+            "p4_change": row.get("p4_change", change.get("change", "")),
+            "matched_rules": append_rule_tag(str(row.get("matched_rules", "")), f"p4-history:{change.get('change', '')}"),
+            "reason": (
+                f"Co-submitted with direct audio files in yupeng changelist {change.get('change', '-')}: {summary}"
+                if sibling
+                else f"Learned from submitted yupeng changelist {change.get('change', '-')}: {summary}"
+            ),
+        }
+
+    def learn_from_p4_history(self) -> None:
+        profile_key = self.repo_var.get()
+        profile = REPO_PROFILES[profile_key]
+        root = Path(self.repo_root_var.get().strip() or profile.root)
+        if not root.exists():
+            messagebox.showerror("Learn History", f"Repo root does not exist:\n{root}")
+            return
+        rules = self.rules_from_ui()
+        depot_marker = self.depot_marker_var.get().strip()
+        p4_client = self.p4()
+
+        def worker() -> dict[str, Any]:
+            changes: list[dict[str, str]] = []
+            scope_messages: list[str] = []
+            active_scope: str | Path = root
+            for scope in p4_history_scopes(profile, root, depot_marker):
+                try:
+                    changes = p4_client.submitted_changes(scope, max_count=120)
+                    scope_messages.append(f"{scope}: {len(changes)} changes")
+                    if changes:
+                        active_scope = scope
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    scope_messages.append(f"{scope}: {exc}")
+            if not changes:
+                return {
+                    "changes": 0,
+                    "files_seen": 0,
+                    "audio_files": 0,
+                    "sibling_files": 0,
+                    "skipped_exclude": 0,
+                    "examples": [],
+                    "scope_messages": scope_messages,
+                    "suspects": [],
+                }
+            examples: list[dict[str, Any]] = []
+            files_seen = 0
+            audio_files = 0
+            sibling_files = 0
+            skipped_exclude = 0
+            suspects: list[dict[str, Any]] = []
+            fallback_all_scope = str(active_scope) == "//..."
+            for change in changes:
+                rows: list[dict[str, Any]] = []
+                for entry in p4_client.describe_change_files(change["change"]):
+                    files_seen += 1
+                    depot_path = entry["depot"]
+                    lowered_depot = normalize_path_text(depot_path).lower()
+                    if fallback_all_scope and profile.kind == "wwise" and "projectefaudio" not in lowered_depot and "/wwise/" not in lowered_depot:
+                        continue
+                    local_path, rel_path = depot_to_local(depot_path, root, profile, depot_marker)
+                    if profile.kind == "wwise":
+                        row = classify_wwise_path(local_path, rel_path, depot_path, "P4 history")
+                    else:
+                        row = classify_unity_path(local_path, rel_path, depot_path, "P4 history", rules)
+                    row["repo_kind"] = profile.kind
+                    row["p4_action"] = entry.get("action", "-")
+                    row["p4_change"] = change["change"]
+                    rows.append(row)
+
+                self.apply_audio_footprint(rows, root, profile)
+                direct_audio_rows = [row for row in rows if self.is_audio_candidate(row)]
+                if not direct_audio_rows:
+                    continue
+                direct_ids = {id(row) for row in direct_audio_rows}
+                change_sibling_files = 0
+                change_excluded_files: list[str] = []
+                for row in rows:
+                    is_direct = id(row) in direct_ids
+                    if not is_direct and len(direct_audio_rows) < 2:
+                        continue
+                    decision = category_to_decision(str(row.get("category", "")))
+                    if decision == "EXCLUDE":
+                        skipped_exclude += 1
+                        change_excluded_files.append(str(row.get("rel_path", "")))
+                        continue
+                    if is_direct:
+                        audio_files += 1
+                        examples.append(self.history_row_to_learning_example(row, profile, change))
+                    else:
+                        sibling_files += 1
+                        change_sibling_files += 1
+                        examples.append(self.history_row_to_learning_example(row, profile, change, sibling=True))
+                if change_sibling_files or change_excluded_files:
+                    suspects.append(
+                        {
+                            "change": change.get("change", ""),
+                            "date": change.get("date", ""),
+                            "summary": change.get("summary", ""),
+                            "direct_audio_files": len(direct_audio_rows),
+                            "sibling_files": change_sibling_files,
+                            "excluded_files": change_excluded_files[:12],
+                        }
+                    )
+
+            return {
+                "changes": len(changes),
+                "files_seen": files_seen,
+                "audio_files": audio_files,
+                "sibling_files": sibling_files,
+                "skipped_exclude": skipped_exclude,
+                "examples": examples,
+                "scope_messages": scope_messages,
+                "suspects": suspects[:80],
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            learning = load_learning()
+            examples: list[dict[str, Any]] = list(learning.get("examples", []))
+            index: dict[tuple[str, str, str], int] = {}
+            for pos, item in enumerate(examples):
+                key = (
+                    str(item.get("source", "")),
+                    str(item.get("change", "")),
+                    normalize_path_text(str(item.get("rel_path", ""))).lower(),
+                )
+                index[key] = pos
+            added = 0
+            updated = 0
+            for example in result["examples"]:
+                key = (
+                    str(example.get("source", "")),
+                    str(example.get("change", "")),
+                    normalize_path_text(str(example.get("rel_path", ""))).lower(),
+                )
+                if key in index:
+                    examples[index[key]] = example
+                    updated += 1
+                else:
+                    index[key] = len(examples)
+                    examples.append(example)
+                    added += 1
+            save_learning({"version": 1, "examples": examples})
+            applied = self.apply_learning_to_rows(self.rows) if self.rows else 0
+            if self.rows:
+                self.refresh_table()
+            report_path = ROOT / "Reports" / f"ProjectEF_P4_History_Audio_Learning_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [
+                "# ProjectEF P4 History Audio Learning\n\n",
+                f"- Repo: {profile.name}\n",
+                f"- Changes scanned: {result['changes']}\n",
+                f"- Files scanned: {result['files_seen']}\n",
+                f"- Direct audio candidates: {result['audio_files']}\n",
+                f"- Audio-changelist sibling files: {result.get('sibling_files', 0)}\n",
+                f"- Skipped excluded/generated/cache candidates: {result['skipped_exclude']}\n",
+                f"- Learning examples saved: {len(result['examples'])}\n",
+                f"- Applied to current table rows: {applied}\n\n",
+                "## Scopes Tried\n\n",
+            ]
+            for item in result.get("scope_messages", []):
+                lines.append(f"- {item}\n")
+            lines.append("\n## Suspicious / Review Changelists\n\n")
+            suspects = result.get("suspects", [])
+            if not suspects:
+                lines.append("- No obvious mixed/excluded audio-history candidates found in this scan.\n")
+            else:
+                for item in suspects:
+                    lines.append(
+                        f"### Change {item.get('change')} ({item.get('date')})\n"
+                        f"- Summary: {item.get('summary')}\n"
+                        f"- Direct audio files: {item.get('direct_audio_files')}\n"
+                        f"- Audio-changelist sibling files: {item.get('sibling_files')}\n"
+                    )
+                    excluded_files = item.get("excluded_files") or []
+                    if excluded_files:
+                        lines.append("- Excluded/generated/cache files seen:\n")
+                        for path in excluded_files:
+                            lines.append(f"  - `{path}`\n")
+                    lines.append("\n")
+            report_path.write_text("".join(lines), encoding="utf-8")
+            text = (
+                f"Learned P4 history: {result['changes']} submitted changelists, "
+                f"{result['files_seen']} files, {result['audio_files']} direct audio candidates, "
+                f"{result.get('sibling_files', 0)} audio-changelist sibling files. "
+                f"Added {added}, updated {updated}, applied {applied}, skipped excluded {result['skipped_exclude']}. "
+                f"Report: {report_path}"
+            )
+            self.status_var.set(text)
+            scope_note = "\n".join(str(item) for item in result.get("scope_messages", [])[:5])
+            messagebox.showinfo(
+                "Learn History",
+                text
+                + (f"\n\nScopes tried:\n{scope_note}" if scope_note else "")
+                + "\n\nThis is read-only P4 history mining. It only updates local learning memory and does not move files.",
+            )
+
+        self.run_p4_operation_async("Learn History", worker, done)
+
     def apply_learned_marks(self) -> None:
         if not self.rows:
             messagebox.showinfo("Apply Learned", "Scan a repo first.")
@@ -1589,6 +1883,9 @@ class OrganizerGui(tk.Tk):
                 continue
             row["learning_score"] = score
             row["learning_source"] = example.get("rel_path", "")
+            if str(example.get("source", "")).startswith("p4-history"):
+                row["history_audio_score"] = score
+                row["history_audio_label"] = str(example.get("source", "p4-history"))
             row["decision"] = learned_decision
             row["upload_advice"] = display_upload(learned_decision)
             row["matched_rules"] = append_rule_tag(str(row.get("matched_rules", "")), f"learned:{score}")
@@ -2093,6 +2390,47 @@ class OrganizerGui(tk.Tk):
             ]
         return [row for row in rows if row["category"] != "Ignore"]
 
+    def is_audio_candidate(self, row: dict[str, Any]) -> bool:
+        if int(row.get("tool_touch_score") or 0) > 0:
+            return True
+        if int(row.get("audio_footprint_score") or 0) > 0:
+            return True
+        if float(row.get("history_audio_score") or 0) > 0:
+            return True
+
+        repo_name = str(row.get("repo") or "")
+        if repo_name == REPO_PROFILES["wwise"].name:
+            return True
+
+        category = str(row.get("category") or "").upper()
+        if any(token in category for token in ("AUDIO", "WWISE", "SOUNDBANK", "BANK")):
+            return True
+
+        rel_path = normalize_path_text(str(row.get("rel_path") or row.get("p4_depot") or "")).lower()
+        suffix = str(row.get("extension") or Path(rel_path).suffix).lower()
+        if suffix in {".bnk", ".wem"}:
+            return True
+        return any(
+            token in rel_path
+            for token in (
+                "wwisebanks/",
+                "generatedsoundbanks/",
+                "assets/wwise/",
+                "runtimeassets/wwise",
+                "wwisescriptableobjects/",
+            )
+        )
+
+    def show_audio_only(self) -> None:
+        self.audio_only_var.set(True)
+        self.refresh_table()
+        self.status_var.set("Audio Only filter is ON. This only filters/highlights rows; it does not move files or create changelists.")
+
+    def show_all_rows(self) -> None:
+        self.audio_only_var.set(False)
+        self.refresh_table()
+        self.status_var.set("Audio Only filter is OFF. Showing all scanned rows.")
+
     def refresh_table(self) -> None:
         self.tree.delete(*self.tree.get_children())
         query = self.search_var.get().strip().lower()
@@ -2102,9 +2440,10 @@ class OrganizerGui(tk.Tk):
         self.summary_var.set(" | ".join(f"{key}:{counts.get(key, 0)}" for key in DECISIONS) + f" | Total:{len(self.rows)}")
         self.visible_iids.clear()
         for row in self.rows:
+            is_audio_candidate = self.is_audio_candidate(row)
             if decision_filter != "All" and row["decision"] != decision_filter:
                 continue
-            if audio_only and not (int(row.get("tool_touch_score") or 0) > 0 or int(row.get("audio_footprint_score") or 0) > 0):
+            if audio_only and not is_audio_candidate:
                 continue
             haystack = " ".join(
                 str(row.get(key, ""))
@@ -2132,13 +2471,14 @@ class OrganizerGui(tk.Tk):
             if query and query not in haystack:
                 continue
             tag = DECISION_META[row["decision"]]["tag"]
+            row_tags = (f"audio_{tag}",) if is_audio_candidate else (tag,)
             iid = row["id"]
             self.visible_iids.append(iid)
             self.tree.insert(
                 "",
                 tk.END,
                 iid=iid,
-                tags=(tag,),
+                tags=row_tags,
                 values=(
                     row["decision"],
                     row["upload_advice"],
