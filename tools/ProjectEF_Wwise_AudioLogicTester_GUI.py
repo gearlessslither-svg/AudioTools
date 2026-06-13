@@ -358,6 +358,9 @@ class AudioLogicTesterGUI(tk.Tk):
                 elif kind == "status":
                     self.status_var.set(str(payload))
                 elif kind == "error":
+                    if self.status_var.get() == "Generating DSL...":
+                        self.source_var.set("Generation failed")
+                    self.log(f"[error] {payload}")
                     messagebox.showerror("Error", str(payload))
                     self.status_var.set("Error")
         except queue.Empty:

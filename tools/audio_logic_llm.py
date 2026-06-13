@@ -373,9 +373,58 @@ def _call_cli(system: str, user: str, cfg: LLMConfig) -> str:
     """Use a logged-in Claude Code or Codex CLI when available."""
     import shutil
     import subprocess
+    import tempfile
+    from pathlib import Path
 
     provider = _provider_alias(cfg.provider)
     prompt = system + "\n\n" + user
+
+    def usable_executable(path: str | None) -> str | None:
+        if not path:
+            return None
+        try:
+            proc = subprocess.run(
+                [path, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=8,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return path if proc.returncode == 0 else None
+
+    def resolve_codex_executable(command: str) -> str | None:
+        candidates: list[str] = []
+        raw = (command or "").strip()
+        if raw and Path(raw).exists():
+            candidates.append(raw)
+        which = shutil.which(raw or "codex")
+        if which:
+            candidates.append(which)
+
+        local_bin = Path(os.environ.get("LOCALAPPDATA", "")) / "OpenAI" / "Codex" / "bin"
+        if local_bin.exists():
+            versioned = sorted(
+                [path / "codex.exe" for path in local_bin.iterdir() if path.is_dir() and (path / "codex.exe").exists()],
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            candidates.extend(str(path) for path in versioned)
+            candidates.append(str(local_bin / "codex.exe"))
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            usable = usable_executable(candidate)
+            if usable:
+                return usable
+        return None
+
     if provider == "claude-cli":
         exe = shutil.which(cfg.claude_cmd)
         if not exe:
@@ -384,14 +433,33 @@ def _call_cli(system: str, user: str, cfg: LLMConfig) -> str:
                 "只有安装并登录可非交互调用的 claude 命令后，才能选择 claude-cli。"
             )
         cmd = [exe, "-p", prompt]
+        output_path: str | None = None
     else:
-        exe = shutil.which(cfg.codex_cmd)
+        exe = resolve_codex_executable(cfg.codex_cmd)
         if not exe:
+            raise PlannerError(
+                "No usable codex CLI found. PATH may be resolving the WindowsApps Codex App stub, "
+                "which returns Access is denied when called by tools. Use ollama/openai, or set "
+                r"Model/command to C:\Users\user1\AppData\Local\OpenAI\Codex\bin\codex.exe"
+            )
             raise PlannerError(
                 "找不到 codex CLI。Codex App 登录态不能被 Python 直接复用；"
                 "只有安装并登录可非交互调用的 codex 命令后，才能选择 codex-cli。"
             )
-        cmd = [exe, "exec", prompt]
+        with tempfile.NamedTemporaryFile(prefix="projectef_codex_dsl_", suffix=".txt", delete=False) as final_file:
+            output_path = final_file.name
+        cmd = [
+            exe,
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+            "--output-last-message",
+            output_path,
+            prompt,
+        ]
     try:
         proc = subprocess.run(
             cmd,
@@ -405,6 +473,13 @@ def _call_cli(system: str, user: str, cfg: LLMConfig) -> str:
         raise PlannerError(f"CLI call timed out after {cfg.timeout}s.") from exc
     if proc.returncode != 0:
         raise PlannerError(f"CLI returned an error:\n{(proc.stderr or proc.stdout)[:800]}")
+    if provider == "codex-cli" and output_path:
+        try:
+            final = Path(output_path).read_text(encoding="utf-8", errors="replace").strip()
+            if final:
+                return final
+        except OSError:
+            pass
     return proc.stdout or ""
 
 
