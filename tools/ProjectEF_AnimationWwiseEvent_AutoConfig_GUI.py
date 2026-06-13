@@ -67,6 +67,7 @@ class AnimationWwiseEventAutoConfigGui(tk.Tk):
         self.min_gap_var = tk.StringVar(value="0.28")
         self.skip_prefab_component_var = tk.BooleanVar(value=False)
         self.audio_aware_spacing_var = tk.BooleanVar(value=True)
+        self.p4_reconcile_var = tk.BooleanVar(value=True)
         self.audio_mode_var = tk.StringVar(value="Click")
         self.playback_speed_var = tk.StringVar(value="1.0")
         self.loop_preview_var = tk.BooleanVar(value=True)
@@ -256,6 +257,16 @@ class AnimationWwiseEventAutoConfigGui(tk.Tk):
             row,
             text="Preview后打开Unity",
             variable=self.auto_open_unity_preview_var,
+            bg=PANEL,
+            fg=INK,
+            activebackground=PANEL,
+            activeforeground=INK,
+            selectcolor=PANEL_2,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        tk.Checkbutton(
+            row,
+            text="Apply后P4 Reconcile",
+            variable=self.p4_reconcile_var,
             bg=PANEL,
             fg=INK,
             activebackground=PANEL,
@@ -530,6 +541,8 @@ class AnimationWwiseEventAutoConfigGui(tk.Tk):
             argv.append("--disable-audio-aware-spacing")
         if apply:
             argv.append("--apply")
+            if self.p4_reconcile_var.get():
+                argv.append("--p4-reconcile")
         return argv
 
     def run_tool_worker(self, apply: bool) -> None:

@@ -233,7 +233,7 @@
       "visible": true,
       "launcher": "27_Wwise_AudioLogicTester_GUI.cmd",
       "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_Wwise_AudioLogicTester_GUI.cmd",
-      "purpose": "Describe a complex audio test in natural language; an LLM (local Ollama or remote GPT/Claude) converts it into a DSL grounded in the project’s real Events/RTPCs/States/Switches; a WAAPI ak.soundengine engine runs it against the open Wwise Authoring instance (post events, timed RTPC ramps, conditional triggers on RTPC crossings, states/switches, loops, parallel) with no game build."
+      "purpose": "Describe a complex Wwise playback test in natural language, save the raw description, generate a traceable DSL through local Ollama, API-backed OpenAI/Anthropic, or logged-in codex/claude CLI when available, then run WAAPI preflight plus playback steps with model/source labels and report output."
     },
     {
       "menu": "28",

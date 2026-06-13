@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -27,6 +28,8 @@ ROOT = Path(r"G:\AI\Material\Wwise")
 REPORT_DIR = ROOT / "\u62A5\u544A"
 RULES_PATH = APP_DIR / "p4_changelist_organizer_rules.json"
 LEARNING_PATH = APP_DIR / "p4_changelist_learning.json"
+AUDIO_TOOL_REPORT_GLOB = "ProjectEF_AnimationWwiseEvent_AutoConfig_*.json"
+AUDIO_FOOTPRINT_JSON = REPORT_DIR / "ProjectEF_Unity_Audio_Footprint.json"
 
 DEFAULT_P4PORT = "ef.p4.blackjack-local.com:1666"
 DEFAULT_P4USER = "yupeng"
@@ -38,6 +41,9 @@ BG = "#0f1722"
 PANEL = "#151f2d"
 PANEL_2 = "#1b2636"
 CARD = "#202c3d"
+PRIMARY = "#43c6a8"
+PRIMARY_ACTIVE = "#5ed8bd"
+PRIMARY_INK = "#07161f"
 INK = "#edf4ff"
 MUTED = "#9fb0c6"
 LINE = "#334258"
@@ -102,7 +108,7 @@ REPO_PROFILES = {
 
 DEFAULT_RULES = {
     "include_keywords": ["Wwise", "Ak", "Audio", "Prefab", "Manifest"],
-    "include_extensions": [".prefab", ".asset", ".unity", ".cs", ".meta", ".json", ".xml", ".bytes", ".bnk", ".wem"],
+    "include_extensions": [".prefab", ".anim", ".asset", ".unity", ".cs", ".meta", ".json", ".xml", ".bytes", ".bnk", ".wem"],
     "review_keywords": ["ProjectSettings", "Packages", "Addressable", "StreamingAssets", "AssetBundle", "Localization"],
     "exclude_path_tokens": ["Library", "Temp", "Logs", "obj", ".vs", ".cursor", "UserSettings", "DerivedDataCache"],
     "exclude_extensions": [".csproj", ".sln", ".user", ".tmp", ".log", ".cache", ".pidb", ".booproj"],
@@ -176,6 +182,111 @@ def safe_stat(path: Path | None) -> dict[str, Any]:
     return {"size_mb": "", "created": "", "modified": ""}
 
 
+def normalized_file_key(value: str | Path | None) -> str:
+    if not value:
+        return ""
+    text = str(value).strip().strip('"')
+    if not text:
+        return ""
+    try:
+        path = Path(text)
+        if path.is_absolute():
+            return normalize_path_text(str(path.resolve())).lower()
+    except Exception:
+        pass
+    return normalize_path_text(text).lower()
+
+
+def parse_datetime_value(value: Any) -> dt.datetime | None:
+    if isinstance(value, dt.datetime):
+        return value
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def row_modified_timestamp(row: dict[str, Any]) -> float:
+    parsed = parse_datetime_value(row.get("modified"))
+    if parsed:
+        return parsed.timestamp()
+    full_path = row.get("full_path")
+    if full_path:
+        try:
+            return Path(full_path).stat().st_mtime
+        except OSError:
+            pass
+    return 0.0
+
+
+def load_audio_tool_touch_index(max_reports: int = 160) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    if not REPORT_DIR.exists():
+        return index
+    reports = sorted(REPORT_DIR.glob(AUDIO_TOOL_REPORT_GLOB), key=lambda item: item.stat().st_mtime, reverse=True)[:max_reports]
+    for report_path in reports:
+        try:
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        report_time = parse_datetime_value(data.get("timestamp")) or dt.datetime.fromtimestamp(report_path.stat().st_mtime)
+        event_name = str(data.get("wwise_event") or "").strip()
+        applied = bool(data.get("applied"))
+
+        candidates: list[tuple[str, str, int]] = []
+        for value in data.get("changed_files") or []:
+            if value:
+                candidates.append((str(value), "changed", 100))
+        for key, role in (("animation", "animation target"), ("prefab", "prefab target")):
+            value = data.get(key)
+            if value and applied:
+                candidates.append((str(value), role, 82))
+
+        for file_path, role, score in candidates:
+            key = normalized_file_key(file_path)
+            if not key:
+                continue
+            existing = index.get(key)
+            if existing and (existing.get("score", 0), existing.get("timestamp", "")) >= (score, report_time.isoformat(timespec="seconds")):
+                continue
+            index[key] = {
+                "score": score,
+                "role": role,
+                "event": event_name,
+                "report": report_path.name,
+                "timestamp": report_time.isoformat(timespec="seconds"),
+                "path": file_path,
+            }
+    return index
+
+
+def load_audio_footprint_index(path: Path = AUDIO_FOOTPRINT_JSON) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    index: dict[str, dict[str, Any]] = {}
+    for row in data.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        keys = [
+            normalized_file_key(row.get("full_path")),
+            normalized_file_key(row.get("path")),
+            normalize_path_text(str(row.get("path") or "")).lower(),
+        ]
+        for key in keys:
+            if key:
+                index[key] = row
+    return index
+
+
 def parse_opened_line(line: str) -> dict[str, str] | None:
     match = re.match(r"^(?P<depot>//.+?)#(?P<rev>[^ ]+) - (?P<action>\w+) (?P<change>.+?) \((?P<type>.+)\)$", line.strip())
     if not match:
@@ -195,7 +306,14 @@ def normalize_p4_change(value: str) -> str:
 
 
 def category_to_decision(category: str) -> str:
-    if category in {"KEEP_THIS_UI_TASK", "UNITY_RULE_KEYWORD_KEEP", "UNITY_RULE_EXTENSION_KEEP", "UNITY_META_PAIR_KEEP"}:
+    if category in {
+        "KEEP_THIS_UI_TASK",
+        "UNITY_RULE_KEYWORD_KEEP",
+        "UNITY_RULE_EXTENSION_KEEP",
+        "UNITY_META_PAIR_KEEP",
+        "UNITY_AUDIO_TOOL_CHANGED_KEEP",
+        "UNITY_AUDIO_TOOL_TARGET_KEEP",
+    }:
         return "KEEP"
     if category in {
         "OLD_PROJECT_EXCLUDE",
@@ -205,7 +323,7 @@ def category_to_decision(category: str) -> str:
         "UNITY_RULE_EXCLUDE",
     }:
         return "EXCLUDE"
-    if category == "GENERATED_BANK_POLICY_REVIEW":
+    if category in {"GENERATED_BANK_POLICY_REVIEW", "UNITY_GENERATED_BANK_POLICY_REVIEW"}:
         return "GENERATED_REVIEW"
     return "REVIEW"
 
@@ -448,6 +566,34 @@ class P4Client:
                 errors.append((proc.stderr or proc.stdout).strip())
         return success, errors
 
+    def reconcile(self, files: list[str], changelist: str = "default") -> tuple[int, list[str], list[str]]:
+        errors: list[str] = []
+        messages: list[str] = []
+        opened = 0
+        args = ["reconcile", "-e", "-a"]
+        if changelist and changelist.lower() != "default":
+            args.extend(["-c", changelist])
+        for index in range(0, len(files), 40):
+            batch = files[index : index + 40]
+            try:
+                proc = self.run(args + batch, timeout=max(self.timeout, 30))
+            except subprocess.TimeoutExpired:
+                errors.append(f"p4 reconcile timed out for batch starting at {index}")
+                continue
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            text = "\n".join(part.strip() for part in [proc.stdout, proc.stderr] if part and part.strip())
+            if text:
+                messages.append(text)
+            if proc.returncode != 0:
+                lowered = text.lower()
+                benign = "file(s) already opened" in lowered or "no file(s) to reconcile" in lowered
+                if not benign:
+                    errors.append(text or f"p4 reconcile failed with exit code {proc.returncode}")
+            opened += len(re.findall(r" - opened for (?:edit|add)\b", text, flags=re.IGNORECASE))
+        return opened, messages, errors
+
     def create_changelist(self, description: str) -> tuple[str, str]:
         clean_lines = safe_p4_description_lines(description.splitlines())[:6]
         attempts = [clean_lines, ["Reconciled offline work"], ["<saved by Perforce>"]]
@@ -590,6 +736,8 @@ def classify_unity_path(
     matched_include_keywords = contains_any(rel_norm, include_keywords)
     matched_review_keywords = contains_any(rel_norm, review_keywords)
     matched_rules: list[str] = []
+    is_bird_runtime_asset = "assets/gameproject/runtimeassets/bird/" in lowered
+    is_bird_art_asset = is_bird_runtime_asset and any(token in lowered for token in ("/mesh/", "/texture/", "/material/"))
 
     if matched_exclude_tokens or suffix in exclude_ext:
         if matched_exclude_tokens:
@@ -604,12 +752,31 @@ def classify_unity_path(
         asset_rel = rel_norm[:-5]
         asset_keyword_matches = contains_any(asset_rel, include_keywords)
         asset_suffix = Path(asset_rel).suffix.lower()
-        if asset_keyword_matches or asset_suffix in {".prefab", ".bnk", ".wem"}:
-            matched_rules.extend(f"meta pair:{item}" for item in asset_keyword_matches)
-            category = "UNITY_META_PAIR_KEEP"
-            action = "Keep with its paired Unity asset if that asset is being submitted."
+        asset_name = Path(asset_rel).name
+        if not asset_suffix:
+            matched_rules.append("folder meta")
+            category = "UNITY_META_PAIR_REVIEW"
+            action = "Review only if this folder meta was created or intentionally changed for the current task."
             confidence = "Medium"
-            reason = "Unity .meta appears paired with an audio/Wwise/prefab/manifest related asset."
+            reason = "Unity folder .meta is not automatically part of an audio change."
+        elif is_bird_runtime_asset and asset_suffix in {".anim", ".prefab"}:
+            matched_rules.append(f"bird audio asset meta:{asset_suffix}")
+            category = "UNITY_BIRD_AUDIO_META_REVIEW"
+            action = "Keep only when the paired bird animation/prefab is part of this audio task."
+            confidence = "Medium"
+            reason = "Bird animation/prefab .meta should follow its paired asset, not the bird name alone."
+        elif is_bird_art_asset:
+            matched_rules.append("bird art meta")
+            category = "UNITY_BIRD_ART_REVIEW"
+            action = "Review with art ownership. Usually do not submit for a bird audio binding task."
+            confidence = "Medium"
+            reason = "Bird mesh/texture/material .meta is not audio binding by itself."
+        elif asset_keyword_matches or asset_suffix in {".prefab", ".bnk", ".wem"}:
+            matched_rules.extend(f"meta pair:{item}" for item in asset_keyword_matches)
+            category = "UNITY_META_PAIR_REVIEW"
+            action = "Review with its paired Unity asset. Keep only if that asset is intentionally being submitted."
+            confidence = "Medium"
+            reason = f"Unity .meta appears paired with {asset_name}; it should not be judged alone."
         else:
             category = "UNITY_META_PAIR_REVIEW"
             action = "Review with the paired asset. Do not submit orphaned meta files."
@@ -623,10 +790,28 @@ def classify_unity_path(
         reason = "Manifest file matched the configured audio upload rules."
     elif "wwisebanks/" in lowered or suffix in {".bnk", ".wem"}:
         matched_rules.append("WwiseBanks")
-        category = "UNITY_RULE_KEYWORD_KEEP"
-        action = "Keep if Unity repo policy versions Wwise runtime banks for this change."
+        category = "UNITY_GENERATED_BANK_POLICY_REVIEW"
+        action = "Review project policy before upload. Runtime banks are generated output unless the task explicitly regenerated banks."
         confidence = "Medium"
-        reason = "Unity Wwise bank/runtime file matched Wwise-related rules."
+        reason = "Unity Wwise bank/runtime file matched Wwise-related rules, but should not be kept by name alone."
+    elif is_bird_runtime_asset and suffix == ".anim":
+        matched_rules.append("bird animation")
+        category = "UNITY_BIRD_AUDIO_ANIM_REVIEW"
+        action = "Keep when this animation received Wwise AnimationEvent keys for the current bird audio task."
+        confidence = "Medium"
+        reason = "Bird animation can contain wing-flap Wwise event keys, but tool evidence or diff should confirm it."
+    elif is_bird_runtime_asset and suffix == ".prefab":
+        matched_rules.append("bird prefab")
+        category = "UNITY_BIRD_AUDIO_PREFAB_REVIEW"
+        action = "Keep when this prefab stores WwiseAudioHelper or AnimationWwiseEventReceiver setup for this task."
+        confidence = "Medium"
+        reason = "Bird prefab can contain call-loop AudioHelper setup and animation-event receiver binding."
+    elif is_bird_art_asset:
+        matched_rules.append("bird art asset")
+        category = "UNITY_BIRD_ART_REVIEW"
+        action = "Review with art ownership. Usually unrelated to bird call/wing-flap audio binding."
+        confidence = "Medium"
+        reason = "Bird mesh/texture/material file matched the bird name, but not the audio binding pattern."
     elif matched_include_keywords:
         matched_rules.extend(f"include keyword:{token}" for token in matched_include_keywords)
         category = "UNITY_RULE_KEYWORD_KEEP"
@@ -689,6 +874,22 @@ def collect_wwise_local_candidates(root: Path) -> list[Path]:
     return out
 
 
+def unity_local_scan_roots(root: Path) -> list[Path]:
+    return [
+        item
+        for item in [
+            root / "WwiseBanks",
+            root / "Assets" / "Wwise",
+            root / "Assets" / "Audio",
+            root / "Assets" / "GameProject" / "RuntimeAssets",
+            root / "Assets" / "GameProject" / "Scripts",
+            root / "Packages",
+            root / "ProjectSettings",
+        ]
+        if item.exists()
+    ]
+
+
 def collect_unity_local_candidates(root: Path, rules: dict[str, Any]) -> list[Path]:
     if not root.exists():
         return []
@@ -699,13 +900,7 @@ def collect_unity_local_candidates(root: Path, rules: dict[str, Any]) -> list[Pa
     since = parse_since(str(rules.get("local_since", DEFAULT_RULES["local_since"])))
     exclude_tokens = [item.lower() for item in rules["exclude_path_tokens"]]
     candidates: list[Path] = []
-    targeted_roots = [
-        root / "WwiseBanks",
-        root / "Assets" / "Wwise",
-        root / "Assets" / "Audio",
-        root / "Packages",
-        root / "ProjectSettings",
-    ]
+    targeted_roots = unity_local_scan_roots(root)
     for scan_root in [item for item in targeted_roots if item.exists()]:
         for dirpath, dirnames, filenames in os.walk(scan_root):
             rel_dir = normalize_path_text(rel_to_root(Path(dirpath), root)).lower()
@@ -715,20 +910,27 @@ def collect_unity_local_candidates(root: Path, rules: dict[str, Any]) -> list[Pa
                 if not any(token and token in dirname.lower() for token in exclude_tokens)
                 and not any(token and token in f"{rel_dir}/{dirname.lower()}" for token in exclude_tokens)
             ]
+            include_exts = {normalize_extension(str(item)) for item in rules["include_extensions"]}
+            kw_terms = [str(item) for item in rules["include_keywords"] + rules["review_keywords"]]
             for filename in filenames:
                 path = Path(dirpath) / filename
+                rel = rel_to_root(path, root)
+                rel_norm = normalize_path_text(rel)
+                suffix = path.suffix.lower()
+                path_matches = bool(contains_any(rel_norm, kw_terms))
+                ext_matches = suffix in include_exts
+                # Cheap name/ext check first; only stat() files that might qualify or
+                # whose recency we still need to test. Avoids stat()-ing huge code dirs.
+                if path_matches or ext_matches:
+                    candidates.append(path)
+                    continue
                 try:
                     stat = path.stat()
                 except OSError:
                     continue
                 created = dt.datetime.fromtimestamp(stat.st_ctime)
                 modified = dt.datetime.fromtimestamp(stat.st_mtime)
-                rel = rel_to_root(path, root)
-                rel_norm = normalize_path_text(rel)
-                suffix = path.suffix.lower()
-                path_matches = bool(contains_any(rel_norm, [str(item) for item in rules["include_keywords"] + rules["review_keywords"]]))
-                ext_matches = suffix in {normalize_extension(str(item)) for item in rules["include_extensions"]}
-                if created >= since or modified >= since or path_matches or ext_matches:
+                if created >= since or modified >= since:
                     candidates.append(path)
     return sorted(set(candidates), key=lambda item: rel_to_root(item, root).lower())
 
@@ -740,7 +942,7 @@ def collect_unity_local_candidates_with_rg(root: Path, rules: dict[str, Any]) ->
     since = parse_since(str(rules.get("local_since", DEFAULT_RULES["local_since"])))
     include_keywords = [str(item) for item in rules["include_keywords"]]
     include_ext = {normalize_extension(str(item)) for item in rules["include_extensions"]}
-    strong_ext = {".prefab", ".bnk", ".wem", ".wwu", ".wproj", ".wav", ".xml", ".bytes"}
+    strong_ext = {".prefab", ".anim", ".bnk", ".wem", ".wwu", ".wproj", ".wav", ".xml", ".bytes"}
 
     globs: list[str] = []
     for keyword in include_keywords:
@@ -763,11 +965,15 @@ def collect_unity_local_candidates_with_rg(root: Path, rules: dict[str, Any]) ->
         if ext:
             globs.append(f"!*{ext}")
 
-    cmd = [rg, "--files", str(root)]
+    scan_roots = unity_local_scan_roots(root)
+    if not scan_roots:
+        return []
+    cmd = [rg, "--files"]
+    cmd.extend(str(path) for path in scan_roots)
     for glob in globs:
         cmd.extend(["-g", glob])
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25)
     except Exception:
         return []
     if proc.returncode not in {0, 1}:
@@ -791,6 +997,16 @@ def collect_unity_local_candidates_with_rg(root: Path, rules: dict[str, Any]) ->
     return sorted(set(candidates), key=lambda item: rel_to_root(item, root).lower())
 
 
+def wwisebank_reconcile_paths(profile: RepoProfile, root: Path) -> list[str]:
+    if profile.kind == "unity":
+        bank_roots = [root / "WwiseBanks"]
+    elif profile.kind == "wwise":
+        bank_roots = [root / "GeneratedSoundBanks"]
+    else:
+        bank_roots = []
+    return [str(bank_root / "...") for bank_root in bank_roots if bank_root.exists()]
+
+
 class OrganizerGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -804,6 +1020,10 @@ class OrganizerGui(tk.Tk):
         self.visible_iids: list[str] = []
         self.p4_ok = False
         self.p4_message = ""
+        self._scanning = False
+        self._scan_token = 0
+        self._p4_operation_running = False
+        self._skip_next_auto_bank_reconcile = False
 
         self.port_var = tk.StringVar(value=DEFAULT_P4PORT)
         self.user_var = tk.StringVar(value=DEFAULT_P4USER)
@@ -824,6 +1044,9 @@ class OrganizerGui(tk.Tk):
 
         self.search_var = tk.StringVar()
         self.decision_filter_var = tk.StringVar(value="All")
+        self.audio_only_var = tk.BooleanVar(value=False)
+        self.include_local_candidates_var = tk.BooleanVar(value=False)
+        self.auto_reconcile_banks_var = tk.BooleanVar(value=True)
         self.task_goal_var = tk.StringVar(value="")
         self.ollama_url_var = tk.StringVar(value=DEFAULT_OLLAMA_URL)
         self.local_model_var = tk.StringVar(value=DEFAULT_LOCAL_MODEL)
@@ -883,7 +1106,18 @@ class OrganizerGui(tk.Tk):
         self.entry(p4_panel, "P4CLIENT", self.client_var, 360).pack(side=tk.LEFT, padx=8, pady=10)
         self.entry(p4_panel, "Timeout", self.timeout_var, 60).pack(side=tk.LEFT, padx=8, pady=10)
         self.button(p4_panel, "Test P4", self.test_p4).pack(side=tk.LEFT, padx=8)
-        self.button(p4_panel, "Scan Selected Repo", self.scan).pack(side=tk.LEFT, padx=8)
+        self.scan_button = self.button(
+            p4_panel,
+            "SCAN / Refresh List",
+            self.scan,
+            bg=PRIMARY,
+            fg=PRIMARY_INK,
+            active_bg=PRIMARY_ACTIVE,
+        )
+        self.scan_button.configure(font=("Segoe UI", 10, "bold"), padx=18, pady=8)
+        self.scan_button.pack(side=tk.LEFT, padx=8)
+        self.scan_progress = ttk.Progressbar(p4_panel, mode="indeterminate", length=150)
+        self.scan_progress.pack(side=tk.LEFT, padx=(0, 8))
         self.button(p4_panel, "Export CSV", self.export_csv).pack(side=tk.LEFT, padx=8)
         self.button(p4_panel, "Open Reports", lambda: os.startfile(str(REPORT_DIR))).pack(side=tk.LEFT, padx=8)
 
@@ -944,6 +1178,40 @@ class OrganizerGui(tk.Tk):
         combo = ttk.Combobox(toolbar, textvariable=self.decision_filter_var, values=["All"] + DECISIONS, width=18, state="readonly")
         combo.pack(side=tk.LEFT, padx=(0, 12))
         combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_table())
+        tk.Checkbutton(
+            toolbar,
+            text="Audio Only",
+            variable=self.audio_only_var,
+            command=self.refresh_table,
+            bg=PANEL,
+            fg=INK,
+            selectcolor=PANEL_2,
+            activebackground=PANEL,
+            activeforeground=INK,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        tk.Checkbutton(
+            toolbar,
+            text="Include Local Scan",
+            variable=self.include_local_candidates_var,
+            bg=PANEL,
+            fg=INK,
+            selectcolor=PANEL_2,
+            activebackground=PANEL,
+            activeforeground=INK,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        tk.Checkbutton(
+            toolbar,
+            text="Auto Reconcile WwiseBanks",
+            variable=self.auto_reconcile_banks_var,
+            bg=PANEL,
+            fg=INK,
+            selectcolor=PANEL_2,
+            activebackground=PANEL,
+            activeforeground=INK,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 10))
         for decision, label in [("KEEP", "Mark Keep"), ("REVIEW", "Mark Review"), ("EXCLUDE", "Mark Exclude"), ("GENERATED_REVIEW", "Mark Generated")]:
             self.button(toolbar, label, lambda value=decision: self.mark_selected(value)).pack(side=tk.LEFT, padx=4)
 
@@ -968,8 +1236,16 @@ class OrganizerGui(tk.Tk):
             activeforeground=INK,
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT, padx=(18, 4))
-        self.button(apply_panel, "Selected -> New CL", self.move_selected_to_new_cl, bg="#2f6f5e").pack(side=tk.LEFT, padx=4)
-        self.button(apply_panel, "Apply Move To CLs", self.apply_moves).pack(side=tk.LEFT, padx=(20, 6))
+        self.reconcile_button = self.button(apply_panel, "Reconcile Selected Local", self.reconcile_selected_local, bg=PRIMARY, fg=PRIMARY_INK, active_bg=PRIMARY_ACTIVE)
+        self.reconcile_button.pack(side=tk.LEFT, padx=4)
+        self.bank_reconcile_button = self.button(apply_panel, "Reconcile WwiseBanks", self.reconcile_wwisebanks, bg=PRIMARY, fg=PRIMARY_INK, active_bg=PRIMARY_ACTIVE)
+        self.bank_reconcile_button.pack(side=tk.LEFT, padx=4)
+        self.selected_new_cl_button = self.button(apply_panel, "Selected -> New CL", self.move_selected_to_new_cl, bg="#2f6f5e")
+        self.selected_new_cl_button.pack(side=tk.LEFT, padx=4)
+        self.visible_audio_new_cl_button = self.button(apply_panel, "Move Visible Audio -> New CL", self.move_visible_audio_to_new_cl, bg="#2f6f5e")
+        self.visible_audio_new_cl_button.pack(side=tk.LEFT, padx=4)
+        self.apply_moves_button = self.button(apply_panel, "Apply Move To CLs", self.apply_moves)
+        self.apply_moves_button.pack(side=tk.LEFT, padx=(20, 6))
         tk.Label(
             apply_panel,
             text="Selected -> New CL creates one pending CL after confirmation. No revert/add/delete/submit.",
@@ -980,12 +1256,14 @@ class OrganizerGui(tk.Tk):
 
         table_frame = tk.Frame(self, bg=BG)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
-        columns = ("decision", "upload", "category", "source", "p4", "modified", "created", "mb", "path", "reason")
+        columns = ("decision", "upload", "category", "tool", "audio", "source", "p4", "modified", "created", "mb", "path", "reason")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
         headings = {
             "decision": "Decision",
             "upload": "Advice",
             "category": "Type",
+            "tool": "Tool",
+            "audio": "Audio",
             "source": "Source",
             "p4": "P4",
             "modified": "Modified",
@@ -994,7 +1272,20 @@ class OrganizerGui(tk.Tk):
             "path": "Path",
             "reason": "Reason",
         }
-        widths = {"decision": 120, "upload": 120, "category": 250, "source": 135, "p4": 100, "modified": 150, "created": 150, "mb": 70, "path": 430, "reason": 560}
+        widths = {
+            "decision": 110,
+            "upload": 110,
+            "category": 240,
+            "tool": 90,
+            "audio": 120,
+            "source": 130,
+            "p4": 100,
+            "modified": 150,
+            "created": 150,
+            "mb": 65,
+            "path": 430,
+            "reason": 560,
+        }
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor=tk.W)
@@ -1021,20 +1312,108 @@ class OrganizerGui(tk.Tk):
     def panel(self, parent: tk.Misc) -> tk.Frame:
         return tk.Frame(parent, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
 
-    def button(self, parent: tk.Misc, text: str, command, bg: str = CARD) -> tk.Button:
+    def button(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command,
+        bg: str = CARD,
+        fg: str = INK,
+        active_bg: str = "#2a3c55",
+    ) -> tk.Button:
         return tk.Button(
             parent,
             text=text,
             command=command,
             bg=bg,
-            fg=INK,
-            activebackground="#2a3c55",
-            activeforeground=INK,
+            fg=fg,
+            activebackground=active_bg,
+            activeforeground=fg,
             relief=tk.FLAT,
             padx=12,
             pady=6,
             font=("Segoe UI", 9, "bold"),
         )
+
+    def set_scan_busy(self, busy: bool) -> None:
+        if not hasattr(self, "scan_button") or not hasattr(self, "scan_progress"):
+            return
+        operation_buttons = [
+            getattr(self, "reconcile_button", None),
+            getattr(self, "bank_reconcile_button", None),
+            getattr(self, "selected_new_cl_button", None),
+            getattr(self, "visible_audio_new_cl_button", None),
+            getattr(self, "apply_moves_button", None),
+        ]
+        if busy:
+            self.scan_button.configure(text="Scanning...", state=tk.DISABLED)
+            self.scan_progress.start(12)
+            for button in operation_buttons:
+                if button:
+                    button.configure(state=tk.DISABLED)
+        else:
+            self.scan_progress.stop()
+            self.scan_progress.configure(value=0)
+            self.scan_button.configure(text="SCAN / Refresh List", state=tk.NORMAL)
+            if not getattr(self, "_p4_operation_running", False):
+                for button in operation_buttons:
+                    if button:
+                        button.configure(state=tk.NORMAL)
+
+    def set_p4_operation_busy(self, busy: bool, label: str = "P4 operation") -> None:
+        if not hasattr(self, "scan_progress"):
+            return
+        buttons = [
+            getattr(self, "reconcile_button", None),
+            getattr(self, "bank_reconcile_button", None),
+            getattr(self, "selected_new_cl_button", None),
+            getattr(self, "visible_audio_new_cl_button", None),
+            getattr(self, "apply_moves_button", None),
+        ]
+        if busy:
+            self._p4_operation_running = True
+            self.status_var.set(f"{label} is running in background. The window should stay responsive.")
+            self.scan_progress.start(12)
+            if hasattr(self, "scan_button"):
+                self.scan_button.configure(state=tk.DISABLED)
+            for button in buttons:
+                if button:
+                    button.configure(state=tk.DISABLED)
+        else:
+            self._p4_operation_running = False
+            if not getattr(self, "_scanning", False):
+                self.scan_progress.stop()
+                self.scan_progress.configure(value=0)
+                if hasattr(self, "scan_button"):
+                    self.scan_button.configure(text="SCAN / Refresh List", state=tk.NORMAL)
+            for button in buttons:
+                if button:
+                    button.configure(state=tk.NORMAL)
+
+    def run_p4_operation_async(self, label: str, worker: Any, done: Any) -> None:
+        if self._p4_operation_running:
+            messagebox.showinfo(label, "Another P4 operation is already running. Please wait for it to finish.")
+            return
+        self.set_p4_operation_busy(True, label)
+
+        def background() -> None:
+            try:
+                result = worker()
+                self.after(0, lambda: self._p4_operation_done(label, done, result))
+            except Exception as exc:  # noqa: BLE001
+                err = exc
+                self.after(0, lambda: self._p4_operation_failed(label, err))
+
+        threading.Thread(target=background, daemon=True).start()
+
+    def _p4_operation_done(self, label: str, done: Any, result: Any) -> None:
+        self.set_p4_operation_busy(False)
+        done(result)
+
+    def _p4_operation_failed(self, label: str, exc: Exception) -> None:
+        self.set_p4_operation_busy(False)
+        self.status_var.set(f"{label} failed: {exc}")
+        messagebox.showerror(f"{label} Failed", str(exc)[:4000])
 
     def entry(self, parent: tk.Misc, label: str, var: tk.StringVar, width_px: int) -> tk.Frame:
         frame = tk.Frame(parent, bg=PANEL)
@@ -1063,6 +1442,9 @@ class OrganizerGui(tk.Tk):
         self.update_repo_status()
 
     def on_repo_changed(self) -> None:
+        self._scan_token += 1
+        self._scanning = False
+        self.set_scan_busy(False)
         self.load_profile_into_vars(self.repo_var.get())
         self.rows = []
         self.refresh_table()
@@ -1071,6 +1453,9 @@ class OrganizerGui(tk.Tk):
     def browse_repo_root(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.repo_root_var.get() or str(Path.home()), parent=self)
         if selected:
+            self._scan_token += 1
+            self._scanning = False
+            self.set_scan_busy(False)
             self.repo_root_var.set(selected)
             self.update_repo_status()
 
@@ -1352,6 +1737,9 @@ class OrganizerGui(tk.Tk):
             "- Unity asset files and their .meta files must be considered as pairs.\n"
             "- Do not recommend submitting cache, user settings, logs, temporary files, or accidental generated files unless project policy requires review.\n"
             "- Generated SoundBanks can be project-policy dependent, so use GENERATED_REVIEW if they need policy review.\n"
+            "- For bird audio binding tasks: wing flap one-shots are AnimationEvent keys on the bird .anim that call PlayAnimationWwiseEvent; continuous bird calls are WwiseAudioHelper setup on the bird prefab; AnimationWwiseEventReceiver.cs/.meta is the runtime bridge and should be reviewed by programmers if new or changed.\n"
+            "- For bird audio binding tasks, KEEP the specific .anim/.prefab/receiver files that are touched by the audio tool or proven by diff; REVIEW generated banks; usually EXCLUDE or REVIEW unrelated Mesh/Texture/FBX files even when the bird name matches.\n"
+            "- AudioTool evidence is stronger than path keywords. If AudioTool says changed or target, treat it as part of the current task unless the diff contradicts it.\n"
             "- Return strict JSON only, no markdown.\n\n"
             'JSON schema: {"decision":"KEEP|REVIEW|EXCLUDE|GENERATED_REVIEW","confidence":"High|Medium|Low","reason":"brief reason in Chinese","program_checks":["short check 1","short check 2"]}\n\n'
             f"Current task goal: {task_goal}\n"
@@ -1363,6 +1751,8 @@ class OrganizerGui(tk.Tk):
             f"Rule decision: {row.get('decision','')}\n"
             f"Rule reason: {row.get('reason','')}\n"
             f"Matched rules: {row.get('matched_rules','') or '-'}\n"
+            f"AudioTool evidence: {row.get('tool_touch_label') or '-'} / {row.get('tool_touch_role') or '-'} / {row.get('tool_touch_event') or '-'} / {row.get('tool_touch_report') or '-'}\n"
+            f"Audio footprint evidence: {row.get('audio_footprint_label') or '-'} / {row.get('audio_footprint_bucket') or '-'} / {row.get('audio_footprint_evidence') or '-'} / {row.get('audio_footprint_events') or '-'}\n"
             f"Diff or file excerpt:\n{diff_excerpt or '(no diff excerpt available)'}\n"
         )
 
@@ -1386,36 +1776,284 @@ class OrganizerGui(tk.Tk):
         row["reason"] = f"Local AI: {reason} Original rule: {original_reason}"
 
     def scan(self) -> None:
+        if getattr(self, "_p4_operation_running", False):
+            self.status_var.set("A P4 operation is running. Scan will be available after it finishes.")
+            return
+        # Re-entrancy guard: ignore extra clicks while a scan is running.
+        if getattr(self, "_scanning", False):
+            self.status_var.set("Scan is already running in background. Please wait.")
+            self.set_scan_busy(True)
+            return
         self.save_rules_from_ui()
         profile = self.profile()
         root = self.profile_root()
         rules = self.rules_from_ui()
-        self.status_var.set(f"Scanning {profile.name}: P4 opened list first, local fallback if unavailable...")
-        self.update_idletasks()
+        p4_client = self.p4()
+        depot_marker = self.depot_marker_var.get()
+        include_local_candidates = self.include_local_candidates_var.get()
+        auto_reconcile_banks = self.auto_reconcile_banks_var.get() and not self._skip_next_auto_bank_reconcile
+        self._skip_next_auto_bank_reconcile = False
+        self._scan_token += 1
+        scan_token = self._scan_token
+        self._scanning = True
+        self.set_scan_busy(True)
+        mode_bits = ["P4 opened"]
+        if include_local_candidates:
+            mode_bits.append("local candidates")
+        if auto_reconcile_banks:
+            mode_bits.append("WwiseBank reconcile")
+        mode = " + ".join(mode_bits)
+        self.status_var.set(f"Scanning {profile.name} ({mode}) in background. The window should stay responsive.")
 
-        rows: list[dict[str, Any]] = []
-        ok, message, entries = self.p4().opened_entries(root)
-        self.p4_ok = ok
-        self.p4_message = message
+        def worker() -> None:
+            try:
+                result = self._scan_compute(
+                    scan_token,
+                    profile,
+                    root,
+                    rules,
+                    p4_client,
+                    depot_marker,
+                    include_local_candidates,
+                    auto_reconcile_banks,
+                )
+                self.after(0, lambda: self._scan_done(result))
+            except Exception as exc:  # noqa: BLE001
+                err = exc
+                self.after(0, lambda: self._scan_failed(scan_token, err))
 
+        # Heavy work (p4 + filesystem walk) runs OFF the Tk thread so the GUI
+        # stays responsive instead of going "Not Responding".
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _scan_compute(
+        self,
+        scan_token: int,
+        profile: "RepoProfile",
+        root: Path,
+        rules: dict[str, Any],
+        p4_client: P4Client,
+        depot_marker: str,
+        include_local_candidates: bool,
+        auto_reconcile_banks: bool,
+    ) -> dict[str, Any]:
+        """Heavy scan work runs in a worker thread. Do not read Tk variables here."""
+        bank_reconcile_message = ""
+        if auto_reconcile_banks:
+            bank_paths = wwisebank_reconcile_paths(profile, root)
+            if bank_paths:
+                opened, messages, errors = p4_client.reconcile(bank_paths)
+                bank_reconcile_message = f"WwiseBanks reconcile: {opened} opened/add lines"
+                if errors:
+                    bank_reconcile_message += f", {len(errors)} errors"
+                elif messages:
+                    bank_reconcile_message += f", {len(messages)} output blocks"
+            else:
+                bank_reconcile_message = "WwiseBanks reconcile skipped: bank folder not found"
+        ok, message, entries = p4_client.opened_entries(root)
         if ok and entries:
-            rows = self.rows_from_p4_entries(profile, root, entries, rules)
-            source_message = "P4 opened"
+            rows = self.rows_from_p4_entries(profile, root, entries, rules, depot_marker)
+            appended = 0
+            if include_local_candidates:
+                local_rows = self.rows_from_local_fallback(profile, root, rules)
+                existing_keys = {self.row_identity_key(r) for r in rows if self.row_identity_key(r)}
+                for row in local_rows:
+                    key = self.row_identity_key(row)
+                    if key and key in existing_keys:
+                        continue
+                    rows.append(row)
+                    if key:
+                        existing_keys.add(key)
+                    appended += 1
+                source_message = f"P4 opened + local candidates ({appended} local-only)"
+            else:
+                source_message = "P4 opened only. Enable Include Local Scan to search unreconciled local files."
         else:
-            rows = self.rows_from_local_fallback(profile, root, rules)
-            source_message = "Local fallback"
+            if include_local_candidates:
+                rows = self.rows_from_local_fallback(profile, root, rules)
+                source_message = "Local candidates"
+            else:
+                rows = []
+                source_message = "No P4 opened rows loaded. Local scan is disabled."
 
+        audio_tool_count = self.apply_audio_tool_priority(rows, root, profile)
+        audio_footprint_count = self.apply_audio_footprint(rows, root, profile)
+        rows = self.sort_rows_for_task(rows)
         for index, row in enumerate(rows):
             decision = category_to_decision(row["category"])
             row["id"] = str(index)
             row["repo_kind"] = profile.kind
             row["decision"] = decision
             row["upload_advice"] = display_upload(decision)
-        self.rows = rows
+        return {
+            "token": scan_token,
+            "profile_key": profile.key,
+            "root": str(root),
+            "rows": rows,
+            "ok": ok,
+            "message": message,
+            "source_message": source_message,
+            "bank_reconcile_message": bank_reconcile_message,
+            "audio_tool_count": audio_tool_count,
+            "audio_footprint_count": audio_footprint_count,
+        }
+
+    def _scan_done(self, result: dict[str, Any]) -> None:
+        """Apply scan results on the Tk main thread."""
+        if result.get("token") != self._scan_token:
+            return
+        if result.get("profile_key") != self.repo_var.get() or result.get("root") != str(self.profile_root()):
+            self._scanning = False
+            self.set_scan_busy(False)
+            self.status_var.set("Discarded scan result because repo/root changed during scan.")
+            return
+        self._scanning = False
+        self.set_scan_busy(False)
+        self.p4_ok = result["ok"]
+        self.p4_message = result["message"]
+        self.rows = result["rows"]
         learned_count = self.apply_learning_to_rows(self.rows)
         self.refresh_table()
         learned_text = f" Learned applied: {learned_count}." if learned_count else ""
-        self.status_var.set(f"{source_message}. {message} Rows: {len(rows)}.{learned_text}")
+        tool_text = f" Audio-tool priority: {result['audio_tool_count']}." if result["audio_tool_count"] else ""
+        footprint_text = f" Audio footprint: {result['audio_footprint_count']}." if result["audio_footprint_count"] else ""
+        bank_text = f" {result.get('bank_reconcile_message')}." if result.get("bank_reconcile_message") else ""
+        self.status_var.set(
+            f"{result['source_message']}. {result['message']} Rows: {len(self.rows)}.{bank_text}{tool_text}{footprint_text}{learned_text}")
+
+    def _scan_failed(self, scan_token: int, exc: Exception) -> None:
+        if scan_token != self._scan_token:
+            return
+        self._scanning = False
+        self.set_scan_busy(False)
+        self.status_var.set(f"Scan failed: {exc}")
+        messagebox.showerror("Scan failed", str(exc), parent=self)
+
+    def row_identity_key(self, row: dict[str, Any]) -> str:
+        full_path = str(row.get("full_path") or "").strip()
+        if full_path:
+            return normalize_path_text(full_path).lower()
+        rel_path = str(row.get("rel_path") or "").strip()
+        return normalize_path_text(rel_path).lower()
+
+    def row_file_keys(self, row: dict[str, Any], root: Path) -> list[str]:
+        keys: list[str] = []
+        for value in (row.get("full_path"), row.get("reopen_target")):
+            key = normalized_file_key(value)
+            if key:
+                keys.append(key)
+        rel_path = str(row.get("rel_path") or "").strip()
+        if rel_path:
+            keys.append(normalized_file_key(root / rel_path))
+            keys.append(normalize_path_text(rel_path).lower())
+        return list(dict.fromkeys(keys))
+
+    def apply_audio_tool_priority(self, rows: list[dict[str, Any]], root: Path, profile: RepoProfile) -> int:
+        if profile.kind != "unity":
+            return 0
+        touch_index = load_audio_tool_touch_index()
+        touched_count = 0
+        for row in rows:
+            evidence = None
+            for key in self.row_file_keys(row, root):
+                evidence = touch_index.get(key)
+                if evidence:
+                    break
+            if not evidence:
+                row["tool_touch_score"] = 0
+                row["tool_touch_label"] = ""
+                continue
+
+            touched_count += 1
+            score = int(evidence.get("score") or 0)
+            role = str(evidence.get("role") or "target")
+            event_name = str(evidence.get("event") or "-")
+            report_name = str(evidence.get("report") or "-")
+            row["tool_touch_score"] = score
+            row["tool_touch_label"] = "AudioTool"
+            row["tool_touch_role"] = role
+            row["tool_touch_event"] = event_name
+            row["tool_touch_report"] = report_name
+            row["matched_rules"] = append_rule_tag(str(row.get("matched_rules", "")), f"audio-tool:{role}:{event_name}")
+
+            old_reason = row.get("reason", "")
+            if score >= 100:
+                row["category"] = "UNITY_AUDIO_TOOL_CHANGED_KEEP"
+                row["recommended_action"] = "Keep for this task. This file was recorded as changed by the audio auto-config tool."
+                row["confidence"] = "High"
+                prefix = f"Audio tool changed this file for {event_name} ({role})."
+            else:
+                row["category"] = "UNITY_AUDIO_TOOL_TARGET_KEEP"
+                row["recommended_action"] = "Keep for this task if the current diff still matches the audio auto-config result."
+                row["confidence"] = "Medium"
+                prefix = f"Audio tool applied to this target for {event_name} ({role})."
+            row["reason"] = f"{prefix} Report: {report_name}. Original rule: {old_reason}"
+        return touched_count
+
+    def apply_audio_footprint(self, rows: list[dict[str, Any]], root: Path, profile: RepoProfile) -> int:
+        if profile.kind != "unity":
+            return 0
+        footprint_index = load_audio_footprint_index()
+        if not footprint_index:
+            return 0
+
+        hit_count = 0
+        for row in rows:
+            footprint = None
+            for key in self.row_file_keys(row, root):
+                footprint = footprint_index.get(key)
+                if footprint:
+                    break
+            if not footprint:
+                row["audio_footprint_score"] = 0
+                row["audio_footprint_label"] = ""
+                continue
+
+            hit_count += 1
+            score = int(footprint.get("score") or 0)
+            confidence = str(footprint.get("confidence") or "Low")
+            bucket = str(footprint.get("bucket") or "audio_related")
+            events = footprint.get("events") or []
+            evidence = footprint.get("evidence") or []
+            evidence_kinds = []
+            if isinstance(evidence, list):
+                evidence_kinds = [str(item.get("kind")) for item in evidence[:4] if isinstance(item, dict) and item.get("kind")]
+
+            row["audio_footprint_score"] = score
+            row["audio_footprint_label"] = f"{confidence}:{score}"
+            row["audio_footprint_bucket"] = bucket
+            row["audio_footprint_events"] = ", ".join(str(item) for item in events[:8])
+            row["audio_footprint_evidence"] = ", ".join(evidence_kinds)
+            row["matched_rules"] = append_rule_tag(str(row.get("matched_rules", "")), f"audio-footprint:{bucket}:{confidence}:{score}")
+
+            if not row.get("tool_touch_score"):
+                original_reason = row.get("reason", "")
+                if bucket == "generated_bank_review":
+                    row["category"] = "UNITY_GENERATED_BANK_POLICY_REVIEW"
+                    row["recommended_action"] = "Review generated-bank policy before moving this file to an upload changelist."
+                else:
+                    row["category"] = "UNITY_AUDIO_FOOTPRINT_REVIEW"
+                    row["recommended_action"] = "Review as an audio candidate. The full-project audio footprint matched this file."
+                row["confidence"] = confidence
+                row["reason"] = (
+                    f"Audio footprint matched {bucket} ({confidence}, score {score}). "
+                    f"Evidence: {row['audio_footprint_evidence'] or '-'}. "
+                    f"Events: {row['audio_footprint_events'] or '-'}. "
+                    f"Original rule: {original_reason}"
+                )
+        return hit_count
+
+    def sort_rows_for_task(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            rows,
+            key=lambda row: (
+                -int(row.get("tool_touch_score") or 0),
+                -int(row.get("audio_footprint_score") or 0),
+                -row_modified_timestamp(row),
+                0 if row.get("source") == "P4 opened" else 1,
+                normalize_path_text(str(row.get("rel_path") or "")).lower(),
+            ),
+        )
 
     def rows_from_p4_entries(
         self,
@@ -1423,11 +2061,12 @@ class OrganizerGui(tk.Tk):
         root: Path,
         entries: list[dict[str, str]],
         rules: dict[str, Any],
+        depot_marker: str,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for entry in entries:
             depot_path = entry["depot"]
-            local_path, rel_path = depot_to_local(depot_path, root, profile, self.depot_marker_var.get())
+            local_path, rel_path = depot_to_local(depot_path, root, profile, depot_marker)
             if local_path and local_path.exists():
                 rel_path = rel_to_root(local_path, root)
             if profile.kind == "wwise":
@@ -1458,11 +2097,14 @@ class OrganizerGui(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         query = self.search_var.get().strip().lower()
         decision_filter = self.decision_filter_var.get()
+        audio_only = self.audio_only_var.get()
         counts = Counter(row["decision"] for row in self.rows)
         self.summary_var.set(" | ".join(f"{key}:{counts.get(key, 0)}" for key in DECISIONS) + f" | Total:{len(self.rows)}")
         self.visible_iids.clear()
         for row in self.rows:
             if decision_filter != "All" and row["decision"] != decision_filter:
+                continue
+            if audio_only and not (int(row.get("tool_touch_score") or 0) > 0 or int(row.get("audio_footprint_score") or 0) > 0):
                 continue
             haystack = " ".join(
                 str(row.get(key, ""))
@@ -1474,6 +2116,14 @@ class OrganizerGui(tk.Tk):
                     "p4_action",
                     "matched_rules",
                     "source",
+                    "tool_touch_label",
+                    "tool_touch_role",
+                    "tool_touch_event",
+                    "tool_touch_report",
+                    "audio_footprint_label",
+                    "audio_footprint_bucket",
+                    "audio_footprint_events",
+                    "audio_footprint_evidence",
                     "learning_source",
                     "local_ai_reason",
                     "program_checks",
@@ -1493,6 +2143,8 @@ class OrganizerGui(tk.Tk):
                     row["decision"],
                     row["upload_advice"],
                     row["category"],
+                    row.get("tool_touch_label", ""),
+                    row.get("audio_footprint_label", ""),
                     row.get("source", "-"),
                     f"{row.get('p4_action', '-')}/{row.get('p4_change', '-')}",
                     row["modified"],
@@ -1530,6 +2182,8 @@ class OrganizerGui(tk.Tk):
             f"Depot path: {row.get('p4_depot') or '-'}\n"
             f"Decision: {row['decision']} / {row['upload_advice']}\n"
             f"Type: {row['category']} | Confidence: {row['confidence']} | Source: {row.get('source','-')} | P4: {row.get('p4_action','-')} {row.get('p4_change','-')}\n"
+            f"Audio tool: {row.get('tool_touch_label') or '-'} | {row.get('tool_touch_role') or '-'} | {row.get('tool_touch_event') or '-'} | {row.get('tool_touch_report') or '-'}\n"
+            f"Audio footprint: {row.get('audio_footprint_label') or '-'} | {row.get('audio_footprint_bucket') or '-'} | {row.get('audio_footprint_evidence') or '-'} | {row.get('audio_footprint_events') or '-'}\n"
             f"Rules: {row.get('matched_rules') or '-'}\n"
             f"Learned: {row.get('learning_score') or '-'} from {row.get('learning_source') or '-'}\n"
             f"Local AI: {row.get('local_ai_confidence') or '-'} | {row.get('local_ai_reason') or '-'}\n"
@@ -1573,6 +2227,15 @@ class OrganizerGui(tk.Tk):
             "local_ai_confidence",
             "local_ai_reason",
             "program_checks",
+            "tool_touch_label",
+            "tool_touch_role",
+            "tool_touch_event",
+            "tool_touch_report",
+            "audio_footprint_label",
+            "audio_footprint_score",
+            "audio_footprint_bucket",
+            "audio_footprint_evidence",
+            "audio_footprint_events",
             "reason",
             "original_reason",
             "matched_rules",
@@ -1626,6 +2289,35 @@ class OrganizerGui(tk.Tk):
             return self.selected_rows()
         return list(self.rows)
 
+    def bank_policy_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            rel_path = normalize_path_text(str(row.get("rel_path", ""))).lower()
+            category = str(row.get("category", ""))
+            decision = str(row.get("decision", ""))
+            if (
+                "wwisebanks/" in rel_path
+                or rel_path.endswith((".bnk", ".wem", ".bnk.meta", ".wem.meta"))
+                or "BANK_POLICY" in category
+                or decision == "GENERATED_REVIEW"
+            ):
+                out.append(row)
+        return out
+
+    def confirm_bank_policy_rows(self, title: str, rows: list[dict[str, Any]]) -> bool:
+        bank_rows = self.bank_policy_rows(rows)
+        if not bank_rows:
+            return True
+        preview = "\n".join(str(row.get("rel_path", "")) for row in bank_rows[:10])
+        if len(bank_rows) > 10:
+            preview += f"\n... {len(bank_rows) - 10} more"
+        return messagebox.askyesno(
+            title,
+            f"The selected scope contains {len(bank_rows)} WwiseBank/generated candidate files.\n\n"
+            f"{preview}\n\n"
+            "These are policy-review files. Continue with the P4 operation?",
+        )
+
     def selected_changelist_description(self, rows: list[dict[str, Any]]) -> str:
         title = "ProjectEF audio selected changes"
         counts = Counter(str(row.get("decision", "REVIEW")) for row in rows)
@@ -1637,6 +2329,103 @@ class OrganizerGui(tk.Tk):
         ]
         lines.append("Created by ProjectEF P4V Changelist Organizer GUI.")
         return "\n".join(lines)
+
+    def reconcile_wwisebanks(self) -> None:
+        profile = self.profile()
+        root = self.profile_root()
+        bank_paths = wwisebank_reconcile_paths(profile, root)
+        if not bank_paths:
+            messagebox.showinfo(
+                "Reconcile WwiseBanks",
+                f"No WwiseBank folder found for {profile.name}:\n{root}",
+            )
+            return
+        preview = "\n".join(bank_paths)
+        if not messagebox.askyesno(
+            "Reconcile WwiseBanks",
+            f"Run p4 reconcile -e -a on the WwiseBank scope?\n\n"
+            f"{preview}\n\n"
+            "This opens changed/new bank files for review. It does not submit, revert, delete, or move files.",
+        ):
+            return
+
+        p4_client = self.p4()
+
+        def worker() -> tuple[int, list[str], list[str]]:
+            return p4_client.reconcile(bank_paths)
+
+        def done(result: tuple[int, list[str], list[str]]) -> None:
+            opened, messages, errors = result
+            text = f"WwiseBanks reconcile requested. Newly opened/add lines detected: {opened}."
+            if messages:
+                text += "\n\nOutput:\n" + "\n".join(messages[:8])
+            if errors:
+                text += "\n\nErrors:\n" + "\n".join(errors[:8])
+            self.status_var.set(text[:1000])
+            messagebox.showinfo("Reconcile WwiseBanks", text[:4000])
+            self._skip_next_auto_bank_reconcile = True
+            self.scan()
+
+        self.run_p4_operation_async("Reconcile WwiseBanks", worker, done)
+
+    def reconcile_selected_local(self) -> None:
+        selected = self.selected_rows()
+        if not selected:
+            messagebox.showinfo("Reconcile Selected Local", "Select one or more local candidate rows first.")
+            return
+
+        files: list[str] = []
+        skipped_opened = 0
+        skipped_missing = 0
+        for row in selected:
+            if row.get("source") == "P4 opened":
+                skipped_opened += 1
+                continue
+            full_path = row.get("full_path")
+            if full_path and Path(str(full_path)).exists():
+                files.append(str(full_path))
+            else:
+                skipped_missing += 1
+
+        if not files:
+            messagebox.showinfo(
+                "Reconcile Selected Local",
+                "No selected local files can be reconciled. P4-opened rows are already in a changelist.",
+            )
+            return
+        if not self.confirm_bank_policy_rows("Reconcile Selected Local", selected):
+            return
+
+        preview = "\n".join(str(Path(path).name) for path in files[:10])
+        if len(files) > 10:
+            preview += f"\n... {len(files) - 10} more"
+        if not messagebox.askyesno(
+            "Reconcile Selected Local",
+            f"Run p4 reconcile -e -a on {len(files)} selected local files?\n\n"
+            f"Skipped P4-opened rows: {skipped_opened}\n"
+            f"Skipped missing paths: {skipped_missing}\n\n"
+            f"{preview}\n\n"
+            "This opens changed/new files in the default pending changelist. It does not submit, revert, delete, or move files.",
+        ):
+            return
+
+        p4_client = self.p4()
+
+        def worker() -> tuple[int, list[str], list[str]]:
+            return p4_client.reconcile(files)
+
+        def done(result: tuple[int, list[str], list[str]]) -> None:
+            opened, messages, errors = result
+            text = f"Reconcile requested for {len(files)} files. Newly opened/add lines detected: {opened}."
+            if messages:
+                text += "\n\nOutput:\n" + "\n".join(messages[:6])
+            if errors:
+                text += "\n\nErrors:\n" + "\n".join(errors[:6])
+            self.status_var.set(text[:1000])
+            messagebox.showinfo("Reconcile Selected Local", text[:4000])
+            self.scan()
+
+        self.run_p4_operation_async("Reconcile Selected Local", worker, done)
 
     def move_selected_to_new_cl(self) -> None:
         selected = self.selected_rows()
@@ -1658,6 +2447,9 @@ class OrganizerGui(tk.Tk):
                 "No selected P4-opened files to move. If the row source says Local fallback, scan with a matching P4 client first.",
             )
             return
+        opened_selected = [row for row in selected if row.get("source") == "P4 opened"]
+        if not self.confirm_bank_policy_rows("Selected -> New CL", opened_selected):
+            return
         description = self.selected_changelist_description(selected)
         preview = "\n".join(str(row.get("rel_path", "")) for row in selected[:8])
         if len(selected) > 8:
@@ -1670,22 +2462,92 @@ class OrganizerGui(tk.Tk):
             "Operations: p4 change -i, then p4 reopen -c. No submit/revert/add/delete/file-content changes.",
         ):
             return
-        try:
-            p4 = self.p4()
-            changelist, create_message = p4.create_changelist(description)
-            success, errors = p4.reopen(changelist, files)
-        except Exception as exc:
-            self.status_var.set(f"Selected -> New CL failed: {exc}")
-            messagebox.showerror("Selected -> New CL Failed", str(exc)[:4000])
+        p4_client = self.p4()
+
+        def worker() -> tuple[str, str, int, list[str]]:
+            changelist, create_message = p4_client.create_changelist(description)
+            success, errors = p4_client.reopen(changelist, files)
+            return changelist, create_message, success, errors
+
+        def done(result: tuple[str, str, int, list[str]]) -> None:
+            changelist, create_message, success, errors = result
+            text = f"Created CL {changelist}.\n{create_message}\nMoved {success}/{len(files)} selected files."
+            if skipped_local:
+                text += f"\nSkipped local fallback rows: {skipped_local}"
+            if errors:
+                text += "\n\nErrors:\n" + "\n".join(errors[:8])
+            self.status_var.set(text[:1000])
+            messagebox.showinfo("Selected -> New CL", text[:4000])
+            self.scan()
+
+        self.run_p4_operation_async("Selected -> New CL", worker, done)
+
+    def move_visible_audio_to_new_cl(self) -> None:
+        if not self.visible_iids:
+            messagebox.showinfo("Visible Audio -> New CL", "No visible rows. Scan or adjust filters first.")
             return
-        text = f"Created CL {changelist}.\n{create_message}\nMoved {success}/{len(files)} selected files."
-        if skipped_local:
-            text += f"\nSkipped local fallback rows: {skipped_local}"
-        if errors:
-            text += "\n\nErrors:\n" + "\n".join(errors[:8])
-        self.status_var.set(text[:1000])
-        messagebox.showinfo("Selected -> New CL", text[:4000])
-        self.scan()
+        visible = [row for row in self.rows if row.get("id") in set(self.visible_iids)]
+        audio_rows = [
+            row for row in visible
+            if int(row.get("tool_touch_score") or 0) > 0 or int(row.get("audio_footprint_score") or 0) > 0
+        ]
+        if not audio_rows:
+            messagebox.showinfo("Visible Audio -> New CL", "No visible audio candidates. Try checking Audio Only or refreshing the Unity repo scan.")
+            return
+
+        files: list[str] = []
+        skipped_local = 0
+        for row in audio_rows:
+            if row.get("source") != "P4 opened":
+                skipped_local += 1
+                continue
+            target = row.get("reopen_target") or row.get("p4_depot") or row.get("full_path")
+            if target:
+                files.append(str(target))
+
+        if not files:
+            messagebox.showinfo(
+                "Visible Audio -> New CL",
+                "Visible audio candidates are not P4-opened rows. Use Reconcile Selected Local first for local fallback rows.",
+            )
+            return
+        opened_audio_rows = [row for row in audio_rows if row.get("source") == "P4 opened"]
+        if not self.confirm_bank_policy_rows("Move Visible Audio -> New CL", opened_audio_rows):
+            return
+
+        description = self.selected_changelist_description(audio_rows)
+        preview = "\n".join(str(row.get("rel_path", "")) for row in audio_rows[:10])
+        if len(audio_rows) > 10:
+            preview += f"\n... {len(audio_rows) - 10} more"
+        if not messagebox.askyesno(
+            "Visible Audio -> New CL",
+            f"Create one new pending changelist and move {len(files)} visible audio candidate files into it?\n\n"
+            f"Visible audio rows: {len(audio_rows)}\n"
+            f"Skipped local fallback rows: {skipped_local}\n\n"
+            f"{preview}\n\n"
+            "Operations: p4 change -i, then p4 reopen -c. No submit/revert/add/delete/file-content changes.",
+        ):
+            return
+
+        p4_client = self.p4()
+
+        def worker() -> tuple[str, str, int, list[str]]:
+            changelist, create_message = p4_client.create_changelist(description)
+            success, errors = p4_client.reopen(changelist, files)
+            return changelist, create_message, success, errors
+
+        def done(result: tuple[str, str, int, list[str]]) -> None:
+            changelist, create_message, success, errors = result
+            text = f"Created CL {changelist}.\n{create_message}\nMoved {success}/{len(files)} visible audio candidate files."
+            if skipped_local:
+                text += f"\nSkipped local fallback rows: {skipped_local}"
+            if errors:
+                text += "\n\nErrors:\n" + "\n".join(errors[:8])
+            self.status_var.set(text[:1000])
+            messagebox.showinfo("Move Visible Audio -> New CL", text[:4000])
+            self.scan()
+
+        self.run_p4_operation_async("Move Visible Audio -> New CL", worker, done)
 
     def apply_moves(self) -> None:
         groups: dict[str, tuple[str, list[str]]] = {
@@ -1718,6 +2580,9 @@ class OrganizerGui(tk.Tk):
                 "No P4-opened rows to move. If the table says Local fallback, P4 CLI did not return a pending list for this repo.",
             )
             return
+        opened_rows = [row for row in rows_to_apply if row.get("source") == "P4 opened"]
+        if not self.confirm_bank_policy_rows("Apply Move To CLs", opened_rows):
+            return
         if not messagebox.askyesno(
             "Apply P4 Reopen",
             f"Move {total} P4-opened files to the specified changelists using `p4 reopen -c`?\n\n"
@@ -1726,18 +2591,25 @@ class OrganizerGui(tk.Tk):
             "This does not create changelists, revert, add, delete, submit, or modify file contents.",
         ):
             return
-        p4 = self.p4()
-        messages = []
-        for decision, (cl, files) in groups.items():
-            if not cl or not files:
-                continue
-            success, errors = p4.reopen(cl, files)
-            messages.append(f"{decision}: moved {success}/{len(files)} to CL {cl}")
-            messages.extend(errors[:5])
-        text = "\n".join(messages)
-        self.status_var.set(text[:1000])
-        messagebox.showinfo("Apply Result", text[:4000])
-        self.scan()
+        p4_client = self.p4()
+
+        def worker() -> list[str]:
+            messages: list[str] = []
+            for decision, (cl, files) in groups.items():
+                if not cl or not files:
+                    continue
+                success, errors = p4_client.reopen(cl, files)
+                messages.append(f"{decision}: moved {success}/{len(files)} to CL {cl}")
+                messages.extend(errors[:5])
+            return messages
+
+        def done(messages: list[str]) -> None:
+            text = "\n".join(messages)
+            self.status_var.set(text[:1000])
+            messagebox.showinfo("Apply Result", text[:4000])
+            self.scan()
+
+        self.run_p4_operation_async("Apply Move To CLs", worker, done)
 
 
 def self_test() -> int:

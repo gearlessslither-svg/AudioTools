@@ -1,0 +1,6 @@
+1 Post Play_Stamina
+2 缓慢Set RTPC_Player_Stamina 从50到0，大概用时15s
+3 到0时post Play_Gasp
+4 快速Set RTPC_Player_Stamina 从0到50，大概用时1s
+5 超过40时Post Play_Recover
+6 男女各自测试完整流程

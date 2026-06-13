@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import subprocess
 import re
 import sys
 import uuid
@@ -17,6 +18,9 @@ from typing import Iterable
 
 DEFAULT_UNITY_ROOT = Path(r"D:\EF New\Client\TargetProject")
 DEFAULT_WWISE_ROOT = Path(r"D:\EF Wwise\ProjectEF")
+DEFAULT_P4PORT = "ef.p4.blackjack-local.com:1666"
+DEFAULT_P4USER = "yupeng"
+DEFAULT_P4CLIENT = "yupeng_ADMIN-V9BNJMS5N"
 REPORT_DIR = Path(__file__).resolve().parents[1] / "\u62a5\u544a"
 RECEIVER_RELATIVE_PATH = Path(
     "Assets/GameProject/Scripts/Runtime/GameView/Audio/AnimationWwiseEventReceiver.cs"
@@ -175,6 +179,10 @@ def guid_from_meta(asset_path: Path) -> str:
     return match.group(1).lower()
 
 
+def fuzzy_asset_key(value: str) -> str:
+    return re.sub(r"\d+", "", value.replace("\\", "/").lower())
+
+
 def resolve_asset(root: Path, query: str, suffix: str) -> Path:
     candidate = Path(query)
     if candidate.is_absolute() and candidate.exists():
@@ -186,11 +194,36 @@ def resolve_asset(root: Path, query: str, suffix: str) -> Path:
     if not asset_root.exists():
         raise ToolError(f"Unity Assets folder not found: {asset_root}")
 
+    rooted_candidate = root / candidate
+    if rooted_candidate.exists():
+        return rooted_candidate.resolve()
+
+    search_root = asset_root
+    if not candidate.is_absolute() and candidate.parent != Path("."):
+        rooted_parent = root / candidate.parent
+        if rooted_parent.exists():
+            search_root = rooted_parent
+
     query_name = query.lower()
+    query_file_name = candidate.name.lower()
+    query_file_stem = candidate.stem.lower() if candidate.suffix else query_file_name
     matches: list[Path] = []
-    for path in asset_root.rglob(f"*{suffix}"):
-        if path.name.lower() == query_name or path.stem.lower() == query_name:
+    for path in search_root.rglob(f"*{suffix}"):
+        relative_to_root = str(path.relative_to(root)).replace("\\", "/").lower()
+        if (
+            path.name.lower() == query_name
+            or path.stem.lower() == query_name
+            or path.name.lower() == query_file_name
+            or path.stem.lower() == query_file_stem
+            or relative_to_root == query.replace("\\", "/").lower()
+        ):
             matches.append(path)
+    if not matches:
+        fuzzy_query_name = fuzzy_asset_key(query_file_name)
+        fuzzy_query_stem = fuzzy_asset_key(query_file_stem)
+        for path in search_root.rglob(f"*{suffix}"):
+            if fuzzy_asset_key(path.name) == fuzzy_query_name or fuzzy_asset_key(path.stem) == fuzzy_query_stem:
+                matches.append(path)
     if not matches:
         raise ToolError(f"Could not find {suffix} asset matching: {query}")
     if len(matches) > 1:
@@ -904,16 +937,32 @@ def update_animation_events(animation_text: str, event_name: str, times: list[fl
     return "\n".join(new_lines) + "\n", len(generated), len(existing) - len(preserved)
 
 
-def ensure_receiver_script(unity_root: Path, apply: bool) -> tuple[Path, bool]:
+def read_meta_guid(meta_path: Path) -> str | None:
+    if not meta_path.exists():
+        return None
+    match = re.search(r"^guid:\s*([0-9a-fA-F]{32})\s*$", read_text(meta_path), re.M)
+    return match.group(1).lower() if match else None
+
+
+def ensure_receiver_script(unity_root: Path, apply: bool) -> tuple[Path, bool, str]:
     script_path = unity_root / RECEIVER_RELATIVE_PATH
     meta_path = script_path.with_suffix(script_path.suffix + ".meta")
+
+    if script_path.exists() and meta_path.exists():
+        existing_guid = read_meta_guid(meta_path)
+        if not existing_guid:
+            raise ToolError(f"Receiver meta exists but no guid was found: {meta_path}")
+        return script_path, False, existing_guid
+
     changed = False
     if apply:
-        changed |= write_text_if_changed(script_path, RECEIVER_SOURCE)
-        changed |= write_text_if_changed(meta_path, RECEIVER_META)
+        if not script_path.exists():
+            changed |= write_text_if_changed(script_path, RECEIVER_SOURCE)
+        if not meta_path.exists():
+            changed |= write_text_if_changed(meta_path, RECEIVER_META)
     else:
         changed = not script_path.exists() or not meta_path.exists()
-    return script_path, changed
+    return script_path, changed, RECEIVER_GUID
 
 
 def find_script_guid(unity_root: Path, script_name: str) -> str | None:
@@ -948,9 +997,9 @@ def make_file_id(existing_text: str) -> str:
             return value
 
 
-def ensure_receiver_component(prefab_path: Path, unity_root: Path, apply: bool) -> tuple[bool, str]:
+def ensure_receiver_component(prefab_path: Path, unity_root: Path, apply: bool, receiver_guid: str) -> tuple[bool, str]:
     text = read_text(prefab_path)
-    if f"guid: {RECEIVER_GUID}" in text:
+    if f"guid: {receiver_guid}" in text:
         return False, "receiver already present"
 
     helper_guid = find_script_guid(unity_root, "WwiseAudioHelper")
@@ -975,7 +1024,7 @@ def ensure_receiver_component(prefab_path: Path, unity_root: Path, apply: bool) 
         f"  m_GameObject: {{fileID: {target_go}}}\n"
         "  m_Enabled: 1\n"
         "  m_EditorHideFlags: 0\n"
-        f"  m_Script: {{fileID: 11500000, guid: {RECEIVER_GUID}, type: 3}}\n"
+        f"  m_Script: {{fileID: 11500000, guid: {receiver_guid}, type: 3}}\n"
         "  m_Name: \n"
         "  m_EditorClassIdentifier: \n"
     )
@@ -1011,6 +1060,80 @@ def ensure_receiver_component(prefab_path: Path, unity_root: Path, apply: bool) 
     return True, f"receiver added to GameObject fileID {target_go}"
 
 
+def p4_executable() -> str:
+    known = Path(r"C:\Program Files\Perforce\p4.exe")
+    return str(known) if known.exists() else "p4"
+
+
+def p4_reconcile_changed_files(
+    files: list[str],
+    *,
+    port: str,
+    user: str,
+    client: str,
+    changelist: str,
+) -> dict[str, object]:
+    real_files = [
+        str(Path(item))
+        for item in files
+        if item and not item.endswith(" (planned)") and Path(item).exists()
+    ]
+    result: dict[str, object] = {
+        "enabled": True,
+        "requested_files": real_files,
+        "opened_count": 0,
+        "success": True,
+        "messages": [],
+        "errors": [],
+    }
+    if not real_files:
+        result["messages"] = ["No changed files to reconcile."]
+        return result
+
+    base = [p4_executable(), "-p", port, "-u", user, "-c", client]
+    reconcile_args = ["reconcile", "-e", "-a"]
+    if changelist and changelist.lower() != "default":
+        reconcile_args.extend(["-c", changelist])
+
+    opened_count = 0
+    messages: list[str] = []
+    errors: list[str] = []
+    for index in range(0, len(real_files), 40):
+        batch = real_files[index : index + 40]
+        try:
+            proc = subprocess.run(
+                base + reconcile_args + batch,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            errors.append(f"p4 reconcile timed out for batch starting at {index}")
+            continue
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+
+        text = "\n".join(part.strip() for part in [proc.stdout, proc.stderr] if part and part.strip())
+        if text:
+            messages.append(text)
+        if proc.returncode != 0:
+            lowered = text.lower()
+            benign = "file(s) already opened" in lowered or "no file(s) to reconcile" in lowered
+            if not benign:
+                errors.append(text or f"p4 reconcile failed with exit code {proc.returncode}")
+
+        opened_count += len(re.findall(r" - opened for (?:edit|add)\b", text, flags=re.IGNORECASE))
+
+    result["opened_count"] = opened_count
+    result["messages"] = messages
+    result["errors"] = errors
+    result["success"] = not errors
+    return result
+
+
 def build_report(
     animation_path: Path,
     prefab_path: Path | None,
@@ -1020,6 +1143,7 @@ def build_report(
     analysis: AnalysisResult,
     changed_files: list[str],
     apply: bool,
+    p4_reconcile: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -1063,14 +1187,17 @@ def build_report(
             "y_range": analysis.y_range,
         },
         "changed_files": changed_files,
+        "p4_reconcile": p4_reconcile,
     }
 
 
 def write_report(report: dict[str, object], event_name: str) -> tuple[Path, Path]:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
     safe_event = re.sub(r"[^A-Za-z0-9_.-]+", "_", event_name)
-    json_path = REPORT_DIR / f"ProjectEF_AnimationWwiseEvent_AutoConfig_{safe_event}_{stamp}.json"
+    animation_stem = Path(str(report.get("animation") or "Animation")).stem
+    safe_animation = re.sub(r"[^A-Za-z0-9_.-]+", "_", animation_stem)
+    json_path = REPORT_DIR / f"ProjectEF_AnimationWwiseEvent_AutoConfig_{safe_event}_{safe_animation}_{stamp}.json"
     md_path = json_path.with_suffix(".md")
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     analysis = report["analysis"]  # type: ignore[index]
@@ -1089,6 +1216,7 @@ def write_report(report: dict[str, object], event_name: str) -> tuple[Path, Path
         f"- Mode: {analysis['mode']} / {analysis['metric']}",  # type: ignore[index]
         f"- Event Count: {analysis['event_count']}",  # type: ignore[index]
         f"- Changed Files: {len(report['changed_files'])}",  # type: ignore[arg-type]
+        f"- P4 Reconcile: {report.get('p4_reconcile')}",
         "",
         "## Event Times",
         "",
@@ -1127,6 +1255,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--apply", action="store_true", help="Write Unity assets. Without this, only reports planned changes.")
     parser.add_argument("--skip-prefab-component", action="store_true")
+    parser.add_argument("--p4-reconcile", action="store_true", help="After --apply, run p4 reconcile on files changed by this tool.")
+    parser.add_argument("--p4-port", default=DEFAULT_P4PORT)
+    parser.add_argument("--p4-user", default=DEFAULT_P4USER)
+    parser.add_argument("--p4-client", default=DEFAULT_P4CLIENT)
+    parser.add_argument("--p4-change", default="default", help="Pending changelist for p4 reconcile; default opens files in the default changelist.")
     return parser.parse_args(argv)
 
 
@@ -1188,16 +1321,26 @@ def main(argv: list[str]) -> int:
     elif new_animation_text != animation_text:
         changed_files.append(str(animation_path) + " (planned)")
 
-    receiver_path, receiver_changed = ensure_receiver_script(unity_root, args.apply)
+    receiver_path, receiver_changed, receiver_guid = ensure_receiver_script(unity_root, args.apply)
     if receiver_changed:
         changed_files.append(str(receiver_path) + ("" if args.apply else " (planned)"))
         changed_files.append(str(receiver_path.with_suffix(receiver_path.suffix + ".meta")) + ("" if args.apply else " (planned)"))
 
     prefab_message = "no prefab component requested"
     if prefab_path and not args.skip_prefab_component:
-        prefab_changed, prefab_message = ensure_receiver_component(prefab_path, unity_root, args.apply)
+        prefab_changed, prefab_message = ensure_receiver_component(prefab_path, unity_root, args.apply, receiver_guid)
         if prefab_changed:
             changed_files.append(str(prefab_path) + ("" if args.apply else " (planned)"))
+
+    p4_reconcile_result = None
+    if args.apply and args.p4_reconcile:
+        p4_reconcile_result = p4_reconcile_changed_files(
+            changed_files,
+            port=args.p4_port,
+            user=args.p4_user,
+            client=args.p4_client,
+            changelist=args.p4_change,
+        )
 
     report = build_report(
         animation_path,
@@ -1208,6 +1351,7 @@ def main(argv: list[str]) -> int:
         analysis,
         changed_files,
         args.apply,
+        p4_reconcile_result,
     )
     if source_animation_path:
         report["source_animation"] = str(source_animation_path)
@@ -1235,6 +1379,17 @@ def main(argv: list[str]) -> int:
     print(", ".join(f"{time:.3f}" for time in analysis.times))
     print(f"Receiver: {receiver_path}")
     print(f"Prefab receiver: {prefab_message}")
+    if p4_reconcile_result is not None:
+        print(
+            "P4 reconcile: "
+            f"success={p4_reconcile_result.get('success')} "
+            f"opened={p4_reconcile_result.get('opened_count')} "
+            f"files={len(p4_reconcile_result.get('requested_files', []))}"
+        )
+        errors = p4_reconcile_result.get("errors") or []
+        if errors:
+            print("P4 reconcile errors:")
+            print("\n".join(str(error) for error in errors))
     print(f"Applied: {args.apply}")
     print(f"Report: {md_path}")
     print(f"JSON: {json_path}")
