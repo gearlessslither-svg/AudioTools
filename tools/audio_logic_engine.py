@@ -2,7 +2,8 @@
 
 Executes a structured test plan (DSL) against a running Wwise Authoring instance
 via WAAPI ``ak.soundengine.*``. The engine is intentionally small: post events,
-set/ramp RTPCs, set states/switches, wait, loop, and run simple branches.
+set/ramp RTPCs, set states/switches, move the test emitter/listener, wait, loop,
+and run simple branches.
 """
 from __future__ import annotations
 
@@ -23,6 +24,8 @@ SUPPORTED_TYPES = {
     "ramp_rtpc",
     "set_state",
     "set_switch",
+    "set_distance",
+    "set_position",
     "post_trigger",
     "wait",
     "loop",
@@ -200,6 +203,16 @@ def validate_plan(plan: dict[str, Any], objects: dict[str, Any] | None) -> dict[
                     errors.append(f"{path}: SwitchGroup '{group}' does not exist.")
                 elif value not in maps["switches"][group]:
                     errors.append(f"{path}: Switch '{value}' is not in SwitchGroup '{group}'.")
+
+        elif step_type == "set_distance":
+            distance = _to_float(step.get("distance"))
+            if distance is None or distance < 0:
+                errors.append(f"{path}: set_distance.distance must be a non-negative number.")
+
+        elif step_type == "set_position":
+            for axis in ("x", "y", "z"):
+                if _to_float(step.get(axis, 0)) is None:
+                    errors.append(f"{path}: set_position.{axis} must be numeric.")
 
         elif step_type == "wait":
             secs = _to_float(step.get("seconds", 0))
@@ -575,6 +588,10 @@ class AudioLogicEngine:
             return f"ramp_rtpc {step.get('rtpc', '')} {step.get('waypoints', [])}"
         if step_type in {"set_switch", "set_state"}:
             return f"{step_type} {step.get('group', '')}->{step.get('value', '')}"
+        if step_type == "set_distance":
+            return f"set_distance {step.get('distance', 0)}m"
+        if step_type == "set_position":
+            return f"set_position ({step.get('x', 0)}, {step.get('y', 0)}, {step.get('z', 0)})"
         if step_type == "wait":
             return f"wait {step.get('seconds', 0)}s"
         if step_type == "loop":
@@ -636,6 +653,28 @@ class AudioLogicEngine:
             {"switchGroup": step["group"], "switchState": step["value"], "gameObject": self.gobj},
         )
         self._emit(f"setSwitch {step['group']} -> {step['value']}")
+
+    def _do_set_distance(self, step: dict[str, Any]) -> None:
+        distance = float(step.get("distance", 0))
+        axis = str(step.get("axis", "z")).lower()
+        if axis == "x":
+            x, y, z = distance, 0.0, 0.0
+        elif axis == "y":
+            x, y, z = 0.0, distance, 0.0
+        else:
+            x, y, z = 0.0, 0.0, distance
+        self._set_position(self.listener_gobj, 0.0, 0.0, 0.0)
+        self._set_position(self.gobj, x, y, z)
+        self._call("ak.soundengine.setListeners", {"emitter": self.gobj, "listeners": [self.listener_gobj]})
+        self._emit(f"setDistance emitter->{distance:g}m on {axis}-axis")
+
+    def _do_set_position(self, step: dict[str, Any]) -> None:
+        x = float(step.get("x", 0))
+        y = float(step.get("y", 0))
+        z = float(step.get("z", 0))
+        self._set_position(self.gobj, x, y, z)
+        self._call("ak.soundengine.setListeners", {"emitter": self.gobj, "listeners": [self.listener_gobj]})
+        self._emit(f"setPosition emitter=({x:g}, {y:g}, {z:g})")
 
     def _do_post_trigger(self, step: dict[str, Any]) -> None:
         self._call("ak.soundengine.postTrigger", {"trigger": step["trigger"], "gameObject": self.gobj})

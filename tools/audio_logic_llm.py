@@ -112,6 +112,8 @@ Step types:
      "on_cross":[{"value":<num>,"direction":"up|down|any","do":<step>}]}
   {"type":"set_state","group":"<StateGroup>","value":"<State>"}
   {"type":"set_switch","group":"<SwitchGroup>","value":"<Switch>"}
+  {"type":"set_distance","distance":<meters>,"axis":"x|y|z"}  // move test emitter away from listener
+  {"type":"set_position","x":<meters>,"y":<meters>,"z":<meters>}
   {"type":"post_trigger","trigger":"<Trigger>"}
   {"type":"wait","seconds":<num>}
   {"type":"loop","count":<int>,"steps":[ ... ]}
