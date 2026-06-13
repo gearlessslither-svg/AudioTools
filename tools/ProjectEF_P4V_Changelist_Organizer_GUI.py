@@ -2035,7 +2035,7 @@ class OrganizerGui(tk.Tk):
             "- Do not recommend submitting cache, user settings, logs, temporary files, or accidental generated files unless project policy requires review.\n"
             "- Generated SoundBanks can be project-policy dependent, so use GENERATED_REVIEW if they need policy review.\n"
             "- For bird audio binding tasks: wing flap one-shots are AnimationEvent keys on the bird .anim that call PlayAnimationWwiseEvent; continuous bird calls are WwiseAudioHelper setup on the bird prefab; AnimationWwiseEventReceiver.cs/.meta is the runtime bridge and should be reviewed by programmers if new or changed.\n"
-            "- For bird audio binding tasks, KEEP the specific .anim/.prefab/receiver files that are touched by the audio tool or proven by diff; REVIEW generated banks; usually EXCLUDE or REVIEW unrelated Mesh/Texture/FBX files even when the bird name matches.\n"
+            "- For bird audio binding tasks, KEEP the specific .anim keys and prefab component data touched by the audio tool or proven by diff. AnimationWwiseEventReceiver.cs/.meta is one-time infrastructure: include it only if the script asset itself is newly added or edited; otherwise the prefab's serialized component reference is enough.\n"
             "- AudioTool evidence is stronger than path keywords. If AudioTool says changed or target, treat it as part of the current task unless the diff contradicts it.\n"
             "- Return strict JSON only, no markdown.\n\n"
             'JSON schema: {"decision":"KEEP|REVIEW|EXCLUDE|GENERATED_REVIEW","confidence":"High|Medium|Low","reason":"brief reason in Chinese","program_checks":["short check 1","short check 2"]}\n\n'
