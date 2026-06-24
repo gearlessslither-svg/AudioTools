@@ -4,6 +4,7 @@
   "jira_cookie": "",
   "jql": "",
   "jql_limit": "500",
+  "jira_qa_fields": [],
   "ollama_url": "http://127.0.0.1:11434",
   "local_model": "qwen2.5:7b-instruct"
 }

@@ -1,6 +1,6 @@
-# EF Audio Tools Final
+# EF Audio / Work Tools Final
 
-This folder contains final user-facing launchers only. Source tools stay in their original folders to avoid duplicated versions.
+This folder contains final user-facing launchers only. Source tools stay in their original folders to avoid duplicated versions. It also contains lightweight Windows workflow helpers that are launched from the same entry points.
 
 Recommended entry:
 
@@ -42,6 +42,9 @@ The GUI intentionally shows only the main manual tools. Report generators, backg
 8. `21_Animation_Wwise_Event_AutoConfig.cmd`
    - Opens the Animation Wwise Event AutoConfig GUI.
    - Locates source `.fbx` or editable `.anim` clips, maps source clips to editable runtime `.anim` files, validates the requested Wwise Event, previews analyzed keyframe times on a motion timeline, and writes Animation Events after confirmation.
+   - Supports `auto`, `manual`, `contact`, `downstroke`, and `speed` timing strategies so the same tool can handle UI one-shots, cat/foot/paw contact-style motion, bird wing downstrokes, and generic motion-speed peaks.
+   - Includes a batch panel for pasted text, clipboard-image OCR, and image-file OCR. Multiple OCR images can share one pasted `Event为：...` line and will become separate batch rows. Batch Apply is blocked until every parsed item has passed Batch Preview.
+   - Batch text parsing works without extra dependencies. Image OCR uses a local `tesseract.exe` when available, including the common `C:\Program Files\Tesseract-OCR\tesseract.exe` install path, and falls back to Windows OCR when possible. The GUI shows the current OCR state in the batch panel.
    - Reads the Wwise Event target and source WAV durations. For one-shot `RandomSequenceContainer` targets, it raises the effective event spacing to at least the longest source duration to avoid repeated overlap.
    - Can write a Unity preview request to `D:\EF New\Client\TargetProject\Temp\ProjectEF_AnimationWwiseEventPreviewRequest.json` and open the Unity EditorWindow `ProjectEF/Audio/Animation Wwise Event Preview` for actual prefab animation playback with event markers.
    - The GUI can open the edited `.anim` directly in a text editor for manual inspection or edits.
@@ -56,6 +59,23 @@ The GUI intentionally shows only the main manual tools. Report generators, backg
    - Supports optional Ollama local AI review for selected issues.
    - Supports `Scan + Diff Changes` to compare the current design tree against the previous snapshot and report possible newly added audio needs.
    - Does not modify Jira, Unity, Wwise, P4, or source documents.
+
+10. `28_Audio_Debug_Assistant.cmd`
+   - Scenario-level Wwise and Unity/Wwise debug assistant for Event, node, and issue checks.
+
+11. `29_Daily_Work_Notes.cmd`
+   - General Windows work manager for today's tasks.
+   - Stores local data under `%APPDATA%\EF_Work_Notes`.
+   - Automatically syncs the current date and rolls unfinished items into the next day.
+   - Tracks each item by project, description, priority, and completion status.
+   - Moves completed work into a project-grouped completed pool.
+   - Exports Markdown daily notes and JSON backups.
+
+12. `31_Tool_Documentation_Search_GUI.cmd`
+   - Generates one Markdown document per visible/registered tool from the latest launcher and source code.
+   - Opens a local documentation/search GUI for all generated tool docs.
+   - Supports keyword search, source file inspection paths, local Ollama explanation, remote OpenAI-compatible explanation, and a no-model rule-based explanation fallback.
+   - Writes generated docs and the searchable index under `G:\AI\Material\Wwise\Reports\ToolDocs`.
 
 ## Advanced Hidden Tools
 

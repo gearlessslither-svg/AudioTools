@@ -23,11 +23,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Any
+from typing import Any, Iterable
 from xml.etree import ElementTree
 
 try:
@@ -65,7 +65,9 @@ ROOT = Path(r"G:\AI\Material\Wwise")
 APP_DIR = Path(__file__).resolve().parent
 REPORT_DIR = ROOT / "\u62A5\u544A"
 INDEX_PATH = APP_DIR / "audio_requirement_jira_index.json"
+QA_INDEX_PATH = APP_DIR / "audio_requirement_qa_index.json"
 CONFIG_PATH = APP_DIR / "audio_requirement_jira_triage_config.json"
+JIRA_CACHE_PATH = APP_DIR / "audio_requirement_jira_issue_cache.json"
 SNAPSHOT_DIR = APP_DIR / "audio_requirement_snapshots"
 LATEST_DIFF_PATH = APP_DIR / "audio_requirement_design_diff_latest.json"
 DEDICATED_JIRA_PROFILE_DIR = APP_DIR / "jira_browser_profile"
@@ -76,13 +78,77 @@ DEFAULT_JIRA_URL = "http://ef.jira.blackjack-local.com:8080"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_LOCAL_MODEL = "qwen2.5:7b-instruct"
 INDEX_VERSION = 1
-JIRA_SEARCH_FIELDS = "summary,description,status,assignee,reporter,creator,updated,fixVersions,versions,components,labels,issuetype,priority,project,issuelinks"
+QA_INDEX_VERSION = 1
+JIRA_CACHE_VERSION = 1
+JIRA_SEARCH_FIELDS = "summary,description,status,assignee,reporter,creator,updated,fixVersions,versions,components,labels,issuetype,priority,project,issuelinks,subtasks,parent,attachment"
+MATCH_STATUS_MATCHED = "Matched"
+MATCH_STATUS_NOT_MATCHED = "NotMatched"
+MATCH_STATUS_NEEDS_REMATCH = "NeedsRematch"
+NO_EVIDENCE_LABEL = "NoEvidence"
+UNMATCHED_DESIGN_LABEL = MATCH_STATUS_NOT_MATCHED
+MATCH_RESULT_FIELDS = (
+    "evidence",
+    "audio_required",
+    "ready_state",
+    "confidence",
+    "reason",
+    "can_start",
+    "system",
+    "design_area",
+    "design_doc",
+    "sound_type",
+    "qa_cases",
+    "qa_summary",
+    "qa_path",
+    "qa_open_target",
+    "qa_link_status",
+    "match_status",
+    "matched_at",
+)
+JIRA_MATCH_INPUT_FIELDS = (
+    "summary",
+    "description",
+    "components",
+    "labels",
+    "issue_links",
+    "qa_doc_refs",
+    "qa_design_issues",
+)
 
 TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".html", ".htm"}
 TABLE_EXTENSIONS = {".xlsx"}
 DOC_EXTENSIONS = {".docx"}
 PDF_EXTENSIONS = {".pdf"}
 SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | TABLE_EXTENSIONS | DOC_EXTENSIONS | PDF_EXTENSIONS
+QA_TEXT_EXTENSIONS = {".md", ".txt"}
+QA_SOURCE_EXTENSIONS = QA_TEXT_EXTENSIONS | {".xmind"}
+MAX_DESIGN_PARSE_BYTES = 50 * 1024 * 1024
+JIRA_QA_FIELD_HINTS = {
+    "qa",
+    "smoke",
+    "test",
+    "case",
+    "checklist",
+    "\u5192\u70df",
+    "\u6d4b\u8bd5",
+    "\u7528\u4f8b",
+    "\u9a8c\u6536",
+    "\u6d4b\u8bd5\u6587\u6863",
+    "\u7528\u4f8b\u6587\u6863",
+}
+QA_DESIGN_ISSUE_HINTS = {
+    "qa",
+    "test case",
+    "testcase",
+    "checklist",
+    "acceptance",
+    "\u6d4b\u8bd5\u7528\u4f8b\u8bbe\u8ba1",
+    "\u6d4b\u8bd5\u7528\u4f8b",
+    "\u7528\u4f8b\u8bbe\u8ba1",
+    "\u7528\u4f8b",
+    "\u9a8c\u6536",
+}
+QA_PATH_EXTENSIONS = (".md", ".txt", ".xlsx", ".csv", ".html", ".htm", ".xmind")
 SKIP_DIR_TOKENS = {
     ".git",
     ".svn",
@@ -550,7 +616,14 @@ def should_skip(path: Path) -> bool:
     )
 
 
-def build_design_index(root: Path, progress=None, limit: int = 0) -> dict[str, Any]:
+def build_design_index(
+    root: Path,
+    progress=None,
+    limit: int = 0,
+    previous_index: dict[str, Any] | None = None,
+    max_parse_bytes: int = MAX_DESIGN_PARSE_BYTES,
+    should_cancel=None,
+) -> dict[str, Any]:
     root = root.resolve()
     files = [
         path
@@ -561,27 +634,75 @@ def build_design_index(root: Path, progress=None, limit: int = 0) -> dict[str, A
     if limit:
         files = files[:limit]
 
+    previous_index = previous_index or {}
+    previous_docs = {
+        str(doc.get("path") or ""): doc
+        for doc in previous_index.get("documents", []) or []
+        if isinstance(doc, dict) and doc.get("path")
+    }
+    previous_chunks_by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for chunk in previous_index.get("chunks", []) or []:
+        if isinstance(chunk, dict) and chunk.get("doc_path"):
+            previous_chunks_by_path[str(chunk.get("doc_path"))].append(chunk)
+    previous_requirements_by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for req in previous_index.get("requirements", []) or []:
+        if isinstance(req, dict) and req.get("doc_path"):
+            previous_requirements_by_path[str(req.get("doc_path"))].append(req)
+
     documents: list[dict[str, Any]] = []
     chunks: list[dict[str, Any]] = []
     requirements: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    reused_docs = 0
+    parsed_docs = 0
+    skipped_large_files = 0
 
     for file_index, path in enumerate(files, 1):
+        if should_cancel and should_cancel():
+            raise RuntimeError("Scan canceled.")
         if progress:
             progress(f"Scanning {file_index}/{len(files)}: {path.name}")
         try:
             stat = path.stat()
             rel = normalize_path(path.relative_to(root))
+            mtime = dt.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+            previous_doc = previous_docs.get(rel)
+            if (
+                previous_doc
+                and str(previous_doc.get("mtime") or "") == mtime
+                and int(previous_doc.get("size") or -1) == stat.st_size
+            ):
+                documents.append(dict(previous_doc))
+                chunks.extend(dict(item) for item in previous_chunks_by_path.get(rel, []))
+                requirements.extend(dict(item) for item in previous_requirements_by_path.get(rel, []))
+                reused_docs += 1
+                continue
+            if stat.st_size > max_parse_bytes and path.suffix.lower() in TABLE_EXTENSIONS | DOC_EXTENSIONS | PDF_EXTENSIONS:
+                documents.append({
+                    "path": rel,
+                    "full_path": str(path),
+                    "extension": path.suffix.lower(),
+                    "mtime": mtime,
+                    "size": stat.st_size,
+                    "sha1": "",
+                })
+                errors.append({
+                    "path": str(path),
+                    "error": f"Skipped large changed/new file over {max_parse_bytes // 1024 // 1024}MB. Existing unchanged files are reused from cache.",
+                })
+                skipped_large_files += 1
+                continue
             doc_hash = file_hash(path)
             documents.append({
                 "path": rel,
                 "full_path": str(path),
                 "extension": path.suffix.lower(),
-                "mtime": dt.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                "mtime": mtime,
                 "size": stat.st_size,
                 "sha1": doc_hash,
             })
             file_chunks = chunks_from_file(path, root)
+            parsed_docs += 1
         except Exception as exc:
             errors.append({"path": str(path), "error": str(exc)})
             continue
@@ -607,7 +728,7 @@ def build_design_index(root: Path, progress=None, limit: int = 0) -> dict[str, A
             }
             chunks.append(record)
             if audio_score >= 0.32:
-                req_id = f"AR-{len(requirements) + 1:05d}"
+                req_id = f"AR-{short_hash(rel + chunk_id)}"
                 requirements.append({
                     "id": req_id,
                     "chunk_id": chunk_id,
@@ -642,8 +763,1479 @@ def build_design_index(root: Path, progress=None, limit: int = 0) -> dict[str, A
             "extensions": dict(Counter(doc["extension"] for doc in documents)),
             "ready_states": dict(Counter(req["ready_state"] for req in requirements)),
             "sound_types": dict(Counter(req["sound_type"] for req in requirements)),
+            "reused_docs": reused_docs,
+            "parsed_docs": parsed_docs,
+            "skipped_large_files": skipped_large_files,
+            "max_parse_mb": max_parse_bytes // 1024 // 1024,
         },
     }
+
+
+def qa_relative_path(path: Path, root: Path) -> str:
+    try:
+        return normalize_path(path.relative_to(root))
+    except ValueError:
+        return normalize_path(path)
+
+
+def qa_generated_roots(root: Path) -> list[Path]:
+    root = root.resolve()
+    candidates: list[Path] = []
+    known = root / "Workspace4Acceptance" / ".qoder" / "generated"
+    if known.exists():
+        candidates.append(known)
+    try:
+        for qoder in root.rglob(".qoder"):
+            generated = qoder / "generated"
+            if generated.exists():
+                candidates.append(generated)
+    except Exception:
+        pass
+    if root.name.lower() == "generated" and root.exists():
+        candidates.append(root)
+    seen: set[str] = set()
+    result: list[Path] = []
+    for item in candidates:
+        key = str(item.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item.resolve())
+    return sorted(result, key=lambda item: normalize_path(item).lower())
+
+
+def qa_testcase_roots(root: Path) -> list[Path]:
+    root = root.resolve()
+    candidates = [
+        root / "QA" / "TestCase",
+        root.parent / "QA" / "TestCase",
+        root / "ProjectEF_Trunk" / "QA" / "TestCase",
+        root.parent / "ProjectEF_Trunk" / "QA" / "TestCase",
+    ]
+    if root.name.lower() == "testcase" and root.exists():
+        candidates.append(root)
+    seen: set[str] = set()
+    result: list[Path] = []
+    for item in candidates:
+        try:
+            resolved = item.resolve()
+        except Exception:
+            resolved = item
+        key = str(resolved).lower()
+        if key in seen or not resolved.exists():
+            continue
+        seen.add(key)
+        result.append(resolved)
+    return sorted(result, key=lambda item: normalize_path(item).lower())
+
+
+def qa_scan_roots(root: Path) -> tuple[list[Path], list[Path], list[Path]]:
+    generated_roots = qa_generated_roots(root)
+    testcase_roots = qa_testcase_roots(root)
+    scan_roots = generated_roots + testcase_roots
+    if not scan_roots:
+        scan_roots = [root.resolve()]
+    seen: set[str] = set()
+    deduped: list[Path] = []
+    for item in scan_roots:
+        key = str(item.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item.resolve())
+    return generated_roots, testcase_roots, deduped
+
+
+def qa_root_is_testcase(root: Path) -> bool:
+    return normalize_path(root).lower().endswith("/qa/testcase")
+
+
+def qa_doc_type(path: Path) -> str:
+    name = path.name.lower()
+    parts = {part.lower() for part in path.parts}
+    if path.suffix.lower() == ".xmind":
+        return "XMind"
+    if "jira_batches" in parts:
+        return "JiraBatch"
+    if "checklist" in name:
+        return "Checklist"
+    if "_issues" in name or name.endswith("issues.md"):
+        return "Issues"
+    if "bug_report" in name:
+        return "BugReport"
+    if "task_report" in name:
+        return "TaskReport"
+    return "QADoc"
+
+
+def qa_system_from_path(path: Path, generated_root: Path) -> str:
+    if qa_root_is_testcase(generated_root):
+        return path.stem
+    try:
+        rel = path.relative_to(generated_root)
+        if rel.parts:
+            return rel.parts[0]
+    except ValueError:
+        pass
+    parent = path.parent
+    if parent.name.lower() == "jira_batches":
+        return parent.parent.name
+    return parent.name
+
+
+def clean_markdown_inline(text: str) -> str:
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text or "")
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = text.replace("**", "").replace("__", "")
+    return clean_text(text)
+
+
+def clean_qa_heading(text: str) -> str:
+    text = clean_markdown_inline(text)
+    text = re.sub(r"^\d+[\.\u3001]\s*", "", text)
+    text = re.sub(r"^#+\s*", "", text)
+    return text.strip(" #\t")
+
+
+def extract_story_keys(text: str) -> list[str]:
+    return sorted(set(re.findall(r"\b[A-Z][A-Z0-9]+-\d+\b", text or "")))
+
+
+def split_qa_refs(text: str) -> list[str]:
+    value = clean_markdown_inline(text)
+    value = re.sub(r"^\s*>+\s*", "", value)
+    value = re.sub(
+        r"^\s*(?:\*\*)?(?:\u9a8c\u6536\u4f9d\u636e|\u7b56\u5212\u6848\u6eaf\u6e90|\u7b56\u5212\u6848\u7248\u672c)(?:\*\*)?\s*[:\uff1a]\s*",
+        "",
+        value,
+    )
+    value = value.strip()
+    if not value:
+        return []
+    parts = re.split(r"\s*\+\s*|\s*[;\uff1b]\s*", value)
+    return [part.strip(" -\t") for part in parts if part.strip(" -\t")]
+
+
+def extract_acceptance_refs(text: str) -> list[str]:
+    refs: list[str] = []
+    for line in (text or "").splitlines():
+        if "\u9a8c\u6536\u4f9d\u636e" in line:
+            refs.extend(split_qa_refs(line))
+    return sorted(set(refs))
+
+
+def extract_trace_refs(text: str) -> list[str]:
+    refs: list[str] = []
+    for line in (text or "").splitlines():
+        if "\u7b56\u5212\u6848\u6eaf\u6e90" in line:
+            refs.extend(split_qa_refs(line))
+    return sorted(set(refs))
+
+
+def qa_source_refs_from_case_body(body: str) -> tuple[str, list[str]]:
+    parts = re.split(r"\s*\U0001f4ce\s*", body, maxsplit=1)
+    if len(parts) == 1:
+        return clean_markdown_inline(body), []
+    return clean_markdown_inline(parts[0]), split_qa_refs(parts[1])
+
+
+def derive_qa_steps_and_expected(body: str) -> tuple[str, list[str], str]:
+    body = clean_markdown_inline(body)
+    if not body:
+        return "", [], ""
+    arrow_parts = [part.strip() for part in re.split(r"\s*(?:->|=>|\u2192|\u21d2)\s*", body) if part.strip()]
+    if len(arrow_parts) >= 2:
+        prefix = ""
+        for sep in ("\uff1a", ":"):
+            if sep in arrow_parts[0]:
+                prefix, first_step = arrow_parts[0].split(sep, 1)
+                arrow_parts[0] = first_step.strip()
+                break
+        test_point = prefix.strip() or body
+        return test_point, arrow_parts[:-1], arrow_parts[-1]
+
+    operation_words = {
+        "\u70b9\u51fb",
+        "\u89e6\u53d1",
+        "\u8fdb\u5165",
+        "\u6253\u5f00",
+        "\u5173\u95ed",
+        "\u5207\u6362",
+        "\u8fbe\u6210",
+        "\u6ee1\u8db3",
+        "\u5b8c\u6210",
+        "\u5236\u9020",
+        "\u51c6\u5907",
+        "\u9000\u51fa",
+        "\u91cd\u65b0",
+    }
+    for sep in ("\uff0c", ","):
+        if sep in body:
+            left, right = body.split(sep, 1)
+            left = left.strip()
+            right = right.strip()
+            if left and right and (any(word in left for word in operation_words) or left.endswith(("\u65f6", "\u540e"))):
+                return body, [left], right
+    return body, [], ""
+
+
+def qa_case_kind(section: str) -> str:
+    section = section or ""
+    if "\u5192\u70df" in section:
+        return "Smoke"
+    if "\u7aef\u5230\u7aef" in section or "\u62bd\u67e5" in section or "\u590d\u5408\u94fe\u8def" in section:
+        return "E2E"
+    if "\u6837\u4f8b" in section:
+        return "Sample"
+    return "Checklist"
+
+
+def should_parse_qa_section(section: str) -> bool:
+    if not section:
+        return True
+    blocked = (
+        "\u5f85\u786e\u8ba4",
+        "\u4f7f\u7528\u8bf4\u660e",
+        "\u6587\u6863\u76ee\u7684",
+        "\u5efa\u8bae\u9a8c\u6536\u987a\u5e8f",
+    )
+    return not any(token in section for token in blocked)
+
+
+def parse_qa_checklist_cases(text: str, path: Path, root: Path, doc: dict[str, Any]) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    rel = doc.get("path") or qa_relative_path(path, root)
+    doc_title = doc.get("title") or path.stem
+    acceptance_refs = list(doc.get("acceptance_refs") or [])
+    current_h2 = ""
+    current_h3 = ""
+    checkbox = re.compile(r"^\s*[-*]\s*\[(?P<checked>[ xX])\]\s*(?P<body>.+?)\s*$")
+    heading = re.compile(r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$")
+    priority_re = re.compile(r"^\[(P[0-5])\]\s*", re.I)
+    for line_no, raw_line in enumerate((text or "").splitlines(), 1):
+        line = raw_line.rstrip()
+        heading_match = heading.match(line)
+        if heading_match:
+            level = len(heading_match.group("marks"))
+            title = clean_qa_heading(heading_match.group("title"))
+            if level == 1:
+                doc_title = title or doc_title
+            elif level == 2:
+                current_h2 = title
+                current_h3 = ""
+            elif level == 3:
+                current_h3 = title
+            continue
+        match = checkbox.match(line)
+        if not match or not should_parse_qa_section(current_h2):
+            continue
+        status = "Done" if match.group("checked").strip().lower() == "x" else "Open"
+        body, source_refs = qa_source_refs_from_case_body(match.group("body"))
+        priority = ""
+        priority_match = priority_re.match(body)
+        if priority_match:
+            priority = priority_match.group(1).upper()
+            body = body[priority_match.end() :].strip()
+        test_point, operation_steps, expected_result = derive_qa_steps_and_expected(body)
+        feature_point = current_h3 or current_h2 or doc_title
+        design_refs = sorted(set(acceptance_refs + source_refs))
+        case_id = f"QA-{short_hash(rel + str(line_no) + body)}"
+        token_text = " ".join(
+            str(part)
+            for part in (
+                rel,
+                doc_title,
+                doc.get("system", ""),
+                current_h2,
+                feature_point,
+                test_point,
+                " ".join(operation_steps),
+                expected_result,
+                " ".join(design_refs),
+            )
+        )
+        cases.append({
+            "id": case_id,
+            "doc_id": doc.get("id", ""),
+            "doc_path": rel,
+            "full_path": str(path),
+            "doc_title": doc_title,
+            "system": doc.get("system", ""),
+            "section": current_h2,
+            "kind": qa_case_kind(current_h2),
+            "feature_point": feature_point,
+            "test_point": test_point,
+            "operation_steps": operation_steps,
+            "expected_result": expected_result,
+            "status": status,
+            "priority": priority,
+            "source_refs": source_refs,
+            "design_refs": design_refs,
+            "story_keys": list(doc.get("story_keys") or []),
+            "locator": f"line {line_no}",
+            "raw": body,
+            "tokens": sorted(tokenize(token_text)),
+        })
+    return cases
+
+
+def xmind_clean_title(text: str) -> str:
+    text = clean_text(text)
+    text = re.sub(r"^\s*(?:\[[^\]]+\]|\u3010[^\u3011]+\u3011)\s*", "", text).strip()
+    return text or clean_text(text)
+
+
+def xmind_json_children(topic: dict[str, Any]) -> list[dict[str, Any]]:
+    children = topic.get("children")
+    result: list[dict[str, Any]] = []
+    if not isinstance(children, dict):
+        return result
+    for value in children.values():
+        if isinstance(value, list):
+            result.extend(item for item in value if isinstance(item, dict))
+        elif isinstance(value, dict):
+            attached = value.get("attached")
+            if isinstance(attached, list):
+                result.extend(item for item in attached if isinstance(item, dict))
+            detached = value.get("detached")
+            if isinstance(detached, list):
+                result.extend(item for item in detached if isinstance(item, dict))
+    return result
+
+
+def xmind_json_title(topic: dict[str, Any]) -> str:
+    title = str(topic.get("title") or "").strip()
+    if title:
+        return title
+    attributed = topic.get("attributedTitle")
+    if isinstance(attributed, list):
+        title = "".join(str(part.get("text") or "") for part in attributed if isinstance(part, dict)).strip()
+    return title
+
+
+def xmind_json_markers(topic: dict[str, Any]) -> list[str]:
+    markers = topic.get("markers")
+    if not isinstance(markers, list):
+        return []
+    result: list[str] = []
+    for marker in markers:
+        if isinstance(marker, dict) and marker.get("markerId"):
+            result.append(str(marker.get("markerId")))
+    return result
+
+
+def parse_xmind_json_topics(data: Any) -> list[dict[str, Any]]:
+    sheets = data if isinstance(data, list) else [data]
+    topics: list[dict[str, Any]] = []
+
+    def walk(topic: dict[str, Any], ancestors: list[str], depth: int) -> None:
+        title = xmind_json_title(topic)
+        children = xmind_json_children(topic)
+        if title:
+            path_titles = ancestors + [title]
+            topics.append({
+                "title": title,
+                "path_titles": path_titles,
+                "depth": depth,
+                "has_children": bool(children),
+                "markers": xmind_json_markers(topic),
+            })
+            next_ancestors = path_titles
+        else:
+            next_ancestors = ancestors
+        for child in children:
+            walk(child, next_ancestors, depth + 1)
+
+    for sheet in sheets:
+        if not isinstance(sheet, dict):
+            continue
+        root_topic = sheet.get("rootTopic") or sheet.get("root-topic")
+        if isinstance(root_topic, dict):
+            walk(root_topic, [], 0)
+    return topics
+
+
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def xmind_xml_topic_title(topic: ElementTree.Element) -> str:
+    for child in topic:
+        if xml_local_name(child.tag) == "title":
+            return "".join(child.itertext()).strip()
+    return str(topic.attrib.get("title") or "").strip()
+
+
+def xmind_xml_topic_children(topic: ElementTree.Element) -> list[ElementTree.Element]:
+    result: list[ElementTree.Element] = []
+    for child in topic:
+        if xml_local_name(child.tag) != "children":
+            continue
+        for topics_node in child:
+            if xml_local_name(topics_node.tag) != "topics":
+                continue
+            for item in topics_node:
+                if xml_local_name(item.tag) == "topic":
+                    result.append(item)
+    return result
+
+
+def parse_xmind_xml_topics(xml_bytes: bytes) -> list[dict[str, Any]]:
+    try:
+        root = ElementTree.fromstring(xml_bytes)
+    except Exception:
+        return []
+    topics: list[dict[str, Any]] = []
+
+    def walk(topic: ElementTree.Element, ancestors: list[str], depth: int) -> None:
+        title = xmind_xml_topic_title(topic)
+        children = xmind_xml_topic_children(topic)
+        if title:
+            path_titles = ancestors + [title]
+            topics.append({
+                "title": title,
+                "path_titles": path_titles,
+                "depth": depth,
+                "has_children": bool(children),
+                "markers": [],
+            })
+            next_ancestors = path_titles
+        else:
+            next_ancestors = ancestors
+        for child in children:
+            walk(child, next_ancestors, depth + 1)
+
+    roots: list[ElementTree.Element] = []
+    for sheet in root.iter():
+        if xml_local_name(sheet.tag) != "sheet":
+            continue
+        for child in sheet:
+            if xml_local_name(child.tag) == "topic":
+                roots.append(child)
+    if not roots and xml_local_name(root.tag) == "topic":
+        roots.append(root)
+    for topic in roots:
+        walk(topic, [], 0)
+    return topics
+
+
+def read_xmind_topics(path: Path) -> tuple[str, list[dict[str, Any]]]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if "content.json" in names:
+                data = json.loads(archive.read("content.json").decode("utf-8", errors="replace"))
+                topics = parse_xmind_json_topics(data)
+                title = topics[0]["title"] if topics else path.stem
+                return title, topics
+            if "content.xml" in names:
+                topics = parse_xmind_xml_topics(archive.read("content.xml"))
+                title = topics[0]["title"] if topics else path.stem
+                return title, topics
+    except Exception:
+        return path.stem, []
+    return path.stem, []
+
+
+def xmind_topic_status(markers: list[str]) -> str:
+    marker_text = " ".join(markers).lower()
+    if "task-done" in marker_text or "task-complete" in marker_text:
+        return "Done"
+    return "Open"
+
+
+def xmind_case_kind(path_titles: list[str], file_name: str) -> str:
+    hay = " ".join(path_titles + [file_name]).lower()
+    if "smoke" in hay or "\u5192\u70df" in hay:
+        return "Smoke"
+    if "case" in hay or "\u7528\u4f8b" in hay:
+        return "Checklist"
+    if "fc" in hay:
+        return "FC"
+    return "XMind"
+
+
+def parse_qa_xmind_cases(path: Path, root: Path, doc: dict[str, Any], topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    rel = doc.get("path") or qa_relative_path(path, root)
+    doc_title = doc.get("title") or path.stem
+    acceptance_refs = list(doc.get("acceptance_refs") or [])
+    candidates = [topic for topic in topics if topic.get("depth", 0) > 0 and not topic.get("has_children")]
+    if not candidates:
+        candidates = [topic for topic in topics if topic.get("depth", 0) > 0]
+    for case_index, topic in enumerate(candidates, 1):
+        raw_title = clean_text(str(topic.get("title") or ""))
+        if not raw_title:
+            continue
+        path_titles = [clean_text(str(item)) for item in topic.get("path_titles") or [] if clean_text(str(item))]
+        ancestors = path_titles[:-1]
+        body = xmind_clean_title(raw_title)
+        priority = ""
+        priority_match = re.match(r"^\[(P[0-5])\]\s*", body, re.I)
+        if priority_match:
+            priority = priority_match.group(1).upper()
+            body = body[priority_match.end() :].strip()
+        test_point, operation_steps, expected_result = derive_qa_steps_and_expected(body)
+        if not operation_steps and ancestors:
+            previous = xmind_clean_title(ancestors[-1])
+            if previous and previous != body:
+                operation_steps = [previous]
+        if not expected_result and re.search(r"(?:\bCP\b|\u3010CP\u3011|\[CP\])", raw_title, re.I):
+            expected_result = body
+            if ancestors:
+                test_point = xmind_clean_title(ancestors[-1])
+        feature_point = ""
+        for ancestor in reversed(ancestors):
+            if "\u3010Case\u3011" in ancestor or "[Case]" in ancestor:
+                feature_point = xmind_clean_title(ancestor)
+                break
+        if not feature_point:
+            feature_point = xmind_clean_title(ancestors[-1]) if ancestors else doc_title
+        design_refs = sorted(set(acceptance_refs))
+        case_id = f"QA-{short_hash(rel + str(case_index) + '>'.join(path_titles))}"
+        token_text = " ".join(
+            str(part)
+            for part in (
+                rel,
+                doc_title,
+                doc.get("system", ""),
+                " ".join(path_titles),
+                feature_point,
+                test_point,
+                " ".join(operation_steps),
+                expected_result,
+            )
+        )
+        cases.append({
+            "id": case_id,
+            "doc_id": doc.get("id", ""),
+            "doc_path": rel,
+            "full_path": str(path),
+            "doc_title": doc_title,
+            "system": doc.get("system", ""),
+            "section": xmind_clean_title(ancestors[1]) if len(ancestors) > 1 else doc_title,
+            "kind": xmind_case_kind(path_titles, path.name),
+            "feature_point": feature_point,
+            "test_point": test_point,
+            "operation_steps": operation_steps,
+            "expected_result": expected_result,
+            "status": xmind_topic_status(list(topic.get("markers") or [])),
+            "priority": priority,
+            "source_refs": [],
+            "design_refs": design_refs,
+            "story_keys": list(doc.get("story_keys") or []),
+            "locator": f"xmind topic {case_index}",
+            "raw": " > ".join(path_titles),
+            "tokens": sorted(tokenize(token_text)),
+        })
+    return cases
+
+
+def build_qa_acceptance_index(root: Path, progress=None) -> dict[str, Any]:
+    root = root.resolve()
+    generated_roots, testcase_roots, scan_roots = qa_scan_roots(root)
+    files: list[tuple[Path, Path]] = []
+    for scan_root in scan_roots:
+        for path in scan_root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in QA_SOURCE_EXTENSIONS:
+                files.append((path, scan_root))
+    files.sort(key=lambda item: normalize_path(item[0]).lower())
+
+    documents: list[dict[str, Any]] = []
+    cases: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    doc_by_id: dict[str, dict[str, Any]] = {}
+    cases_by_doc: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    system_story_keys: dict[str, set[str]] = defaultdict(set)
+
+    for file_index, (path, generated_root) in enumerate(files, 1):
+        if progress:
+            progress(f"Scanning QA {file_index}/{len(files)}: {path.name}")
+        try:
+            suffix = path.suffix.lower()
+            xmind_topics: list[dict[str, Any]] = []
+            if suffix == ".xmind":
+                xmind_title, xmind_topics = read_xmind_topics(path)
+                text = "\n".join(str(topic.get("title") or "") for topic in xmind_topics)
+            else:
+                xmind_title = ""
+                text = read_text_file(path)
+            stat = path.stat()
+            rel = qa_relative_path(path, root)
+            title_match = re.search(r"^\s*#\s+(.+?)\s*$", text, re.M)
+            title = xmind_title or (clean_qa_heading(title_match.group(1)) if title_match else path.stem)
+            system = qa_system_from_path(path, generated_root)
+            story_keys = extract_story_keys(text)
+            acceptance_refs = extract_acceptance_refs(text)
+            trace_refs = extract_trace_refs(text)
+            doc_id = f"QADOC-{short_hash(rel)}"
+            doc = {
+                "id": doc_id,
+                "path": rel,
+                "full_path": str(path),
+                "title": title,
+                "system": system,
+                "doc_type": qa_doc_type(path),
+                "generated_root": str(generated_root),
+                "mtime": dt.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                "size": stat.st_size,
+                "sha1": file_hash(path),
+                "story_keys": story_keys,
+                "story_key_source": "Explicit" if story_keys else "",
+                "acceptance_refs": acceptance_refs,
+                "trace_refs": trace_refs,
+                "tokens": sorted(tokenize(f"{rel} {title} {system} {' '.join(acceptance_refs)} {' '.join(trace_refs)}")),
+                "case_count": 0,
+            }
+            if doc["doc_type"] == "XMind":
+                parsed_cases = parse_qa_xmind_cases(path, root, doc, xmind_topics)
+            elif doc["doc_type"] == "Checklist":
+                parsed_cases = parse_qa_checklist_cases(text, path, root, doc)
+            else:
+                parsed_cases = []
+            documents.append(doc)
+            doc_by_id[doc_id] = doc
+            if story_keys:
+                system_story_keys[system].update(story_keys)
+            for case in parsed_cases:
+                cases.append(case)
+                cases_by_doc[doc_id].append(case)
+        except Exception as exc:
+            errors.append({"path": str(path), "error": str(exc)})
+
+    for doc in documents:
+        inferred_keys = sorted(system_story_keys.get(doc.get("system", ""), set()))
+        if not doc.get("story_keys") and inferred_keys:
+            doc["story_keys"] = inferred_keys
+            doc["story_key_source"] = "InferredBySystem"
+        doc["case_count"] = len(cases_by_doc.get(doc["id"], []))
+
+    for case in cases:
+        doc = doc_by_id.get(case.get("doc_id", ""))
+        if doc:
+            case["story_keys"] = list(doc.get("story_keys") or [])
+            case["story_key_source"] = doc.get("story_key_source", "")
+
+    by_story: dict[str, dict[str, Any]] = {}
+    for doc in documents:
+        for key in doc.get("story_keys") or []:
+            entry = by_story.setdefault(key, {"doc_ids": [], "case_ids": []})
+            entry["doc_ids"].append(doc["id"])
+    for case in cases:
+        for key in case.get("story_keys") or []:
+            entry = by_story.setdefault(key, {"doc_ids": [], "case_ids": []})
+            entry["case_ids"].append(case["id"])
+    for entry in by_story.values():
+        entry["doc_ids"] = sorted(set(entry["doc_ids"]))
+        entry["case_ids"] = sorted(set(entry["case_ids"]))
+
+    return {
+        "version": QA_INDEX_VERSION,
+        "generated_at": now_stamp(),
+        "design_root": str(root),
+        "generated_roots": [str(item) for item in generated_roots],
+        "testcase_roots": [str(item) for item in testcase_roots],
+        "scan_roots": [str(item) for item in scan_roots],
+        "documents": documents,
+        "cases": cases,
+        "cases_by_doc": {
+            doc_id: [case.get("id", "") for case in doc_cases]
+            for doc_id, doc_cases in cases_by_doc.items()
+        },
+        "by_story": by_story,
+        "errors": errors,
+        "summary": {
+            "files_scanned": len(documents),
+            "cases": len(cases),
+            "errors": len(errors),
+            "systems": dict(Counter(doc.get("system", "") for doc in documents)),
+            "doc_types": dict(Counter(doc.get("doc_type", "") for doc in documents)),
+            "case_statuses": dict(Counter(case.get("status", "") for case in cases)),
+            "case_kinds": dict(Counter(case.get("kind", "") for case in cases)),
+            "story_keys": len(by_story),
+        },
+    }
+
+
+def load_qa_index() -> dict[str, Any]:
+    if not QA_INDEX_PATH.exists():
+        return {}
+    index = json.loads(QA_INDEX_PATH.read_text(encoding="utf-8"))
+    return ensure_qa_index_lookup(index)
+
+
+def save_qa_index(index: dict[str, Any]) -> None:
+    ensure_qa_index_lookup(index)
+    payload = {key: value for key, value in index.items() if not str(key).startswith("_")}
+    QA_INDEX_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ensure_qa_index_lookup(index: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(index, dict):
+        return {}
+    if not isinstance(index.get("_case_by_id"), dict):
+        index["_case_by_id"] = {
+            str(case.get("id") or ""): case
+            for case in index.get("cases", []) or []
+            if isinstance(case, dict) and case.get("id")
+        }
+    cases_by_doc = index.get("cases_by_doc")
+    if not isinstance(cases_by_doc, dict):
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for case in index.get("cases", []) or []:
+            if not isinstance(case, dict):
+                continue
+            doc_id = str(case.get("doc_id") or "")
+            case_id = str(case.get("id") or "")
+            if doc_id and case_id:
+                grouped[doc_id].append(case_id)
+        index["cases_by_doc"] = dict(grouped)
+    if not isinstance(index.get("_topic_docs"), list) and "qa_topic_tokens" in globals():
+        topic_docs: list[tuple[dict[str, Any], set[str]]] = []
+        for doc in index.get("documents", []) or []:
+            if isinstance(doc, dict):
+                topic_docs.append((doc, qa_topic_tokens(qa_doc_topic_text(doc))))
+        index["_topic_docs"] = topic_docs
+    return index
+
+
+def qa_cases_for_doc_ids(qa_index: dict[str, Any], doc_ids: set[str]) -> list[dict[str, Any]]:
+    if not doc_ids:
+        return list(qa_index.get("cases", []) or [])
+    ensure_qa_index_lookup(qa_index)
+    case_by_id = qa_index.get("_case_by_id") if isinstance(qa_index.get("_case_by_id"), dict) else {}
+    cases_by_doc = qa_index.get("cases_by_doc")
+    if isinstance(cases_by_doc, dict) and case_by_id:
+        result: list[dict[str, Any]] = []
+        for doc_id in doc_ids:
+            for case_id in cases_by_doc.get(doc_id, []) or []:
+                case = case_by_id.get(str(case_id))
+                if case:
+                    result.append(case)
+        return result
+    return [
+        case
+        for case in qa_index.get("cases", []) or []
+        if isinstance(case, dict) and str(case.get("doc_id") or "") in doc_ids
+    ]
+
+
+def jira_field_matches_qa_hint(field: dict[str, Any]) -> bool:
+    hay = f"{field.get('id','')} {field.get('name','')}".lower()
+    return any(hint.lower() in hay for hint in JIRA_QA_FIELD_HINTS)
+
+
+def flatten_jira_strings(value: Any, depth: int = 0) -> list[str]:
+    if depth > 5 or value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (int, float, bool)):
+        return [str(value)]
+    if isinstance(value, list):
+        result: list[str] = []
+        for item in value:
+            result.extend(flatten_jira_strings(item, depth + 1))
+        return result
+    if isinstance(value, dict):
+        result = []
+        for key in ("name", "value", "displayName", "filename", "content", "title", "text"):
+            if key in value:
+                result.extend(flatten_jira_strings(value.get(key), depth + 1))
+        return result
+    return []
+
+
+def looks_like_qa_ref(text: str) -> bool:
+    if not text:
+        return False
+    hay = normalize_path(text).lower()
+    return (
+        any(hint.lower() in hay for hint in JIRA_QA_FIELD_HINTS)
+        or "workspace4acceptance" in hay
+        or ".qoder" in hay
+        or "qa/testcase" in hay
+        or "projectef_trunk/qa/testcase" in hay
+        or "checklist" in hay
+        or re.search(r"\b[A-Z][A-Z0-9]+-\d+\b", text) is not None
+    )
+
+
+def extract_path_like_qa_refs(text: str) -> list[str]:
+    if not text:
+        return []
+    refs: list[str] = []
+    ext_pattern = "|".join(re.escape(ext.lstrip(".")) for ext in QA_PATH_EXTENSIONS)
+    patterns = [
+        rf"(?:[A-Za-z]:[\\/][^\s<>\"|]+?\.({ext_pattern}))",
+        r"(?:ProjectEF_Trunk[\\/](?:QA|qa)[\\/](?:TestCase|testcase)[^\r\n<>\"|]*)",
+        r"(?:(?:QA|qa)[\\/](?:TestCase|testcase)[^\r\n<>\"|]*)",
+        rf"(?:Workspace4Acceptance[\\/][^\s<>\"|]+?\.({ext_pattern}))",
+        rf"(?:\.qoder[\\/][^\s<>\"|]+?\.({ext_pattern}))",
+        rf"(?:generated[\\/][^\s<>\"|]+?\.({ext_pattern}))",
+        rf"(?:[\w\u4e00-\u9fff ._()-]+[\\\/][\w\u4e00-\u9fff ._()\\\/-]+?\.({ext_pattern}))",
+        rf"(?:[\w\u4e00-\u9fff ._()-]*?(?:Checklist|checklist|\u7528\u4f8b|\u9a8c\u6536)[\w\u4e00-\u9fff ._()-]*?\.({ext_pattern}))",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I):
+            value = match.group(0).strip(" \t\r\n，,；;。.)]】>\"'")
+            for sep in ("：", ":"):
+                if sep in value:
+                    tail = value.split(sep)[-1].strip()
+                    if "/" in tail or "\\" in tail:
+                        value = tail
+            refs.append(value)
+    return dedupe_refs_prefer_full_paths(refs)
+
+
+def split_possible_jira_qa_refs(text: str) -> list[str]:
+    text = clean_text(text)
+    refs: list[str] = []
+    refs.extend(re.findall(r"https?://[^\s<>\"]+", text))
+    refs.extend(re.findall(r"[A-Za-z]:[\\/][^\s<>\"]+", text))
+    refs.extend(extract_path_like_qa_refs(text))
+    for line in text.splitlines():
+        line = clean_text(line)
+        if not line:
+            continue
+        line_path_refs = extract_path_like_qa_refs(line)
+        if line_path_refs:
+            refs.extend(line_path_refs)
+            continue
+        if looks_like_qa_ref(line):
+            refs.append(line[:500])
+    return dedupe_keep_order(refs)
+
+
+def extract_jira_qa_refs(fields: dict[str, Any]) -> list[str]:
+    refs: list[str] = []
+    for key, value in fields.items():
+        is_likely_field = key == "attachment" or key.startswith("customfield_")
+        for text in flatten_jira_strings(value):
+            if is_likely_field or looks_like_qa_ref(text):
+                refs.extend(split_possible_jira_qa_refs(text))
+    return dedupe_refs_prefer_full_paths(refs)[:80]
+
+
+def qa_ref_match_candidates(ref: str) -> list[str]:
+    raw_refs = [ref] + extract_path_like_qa_refs(ref)
+    candidates: list[str] = []
+
+    def is_specific(candidate: str) -> bool:
+        value = candidate.strip().lower()
+        if len(value) < 4:
+            return False
+        if value.count("?") >= 2:
+            return False
+        generic = {
+            "checklist",
+            "_checklist",
+            "issues",
+            "_issues",
+            "testcase",
+            "test_case",
+            "testcases",
+            "test_cases",
+        }
+        if value in generic:
+            return False
+        if value.endswith("_checklist") and len(value) <= len("_checklist") + 2:
+            return False
+        if value.endswith("_issues") and len(value) <= len("_issues") + 2:
+            return False
+        return True
+
+    for raw in raw_refs:
+        norm = normalize_path(str(raw or "")).lower().strip()
+        if not norm:
+            continue
+        if is_specific(norm):
+            candidates.append(norm)
+        ref_name = re.split(r"[\\/]", norm.rstrip("/"))[-1]
+        if ref_name and is_specific(ref_name):
+            candidates.append(ref_name)
+        stem = Path(ref_name).stem.lower()
+        if stem and is_specific(stem):
+            candidates.append(stem)
+    for key in re.findall(r"\b[A-Z][A-Z0-9]+-\d+\b", ref or ""):
+        candidates.append(key.lower())
+    return dedupe_keep_order(candidate for candidate in candidates if is_specific(candidate))
+
+
+def qa_ref_matches_document(ref: str, doc: dict[str, Any]) -> bool:
+    if not ref:
+        return False
+    hay = normalize_path(" ".join(str(doc.get(key, "")) for key in ("path", "full_path", "title"))).lower()
+    story_keys = {str(key).lower() for key in doc.get("story_keys") or []}
+    for candidate in qa_ref_match_candidates(ref):
+        if candidate in story_keys or candidate in hay:
+            return True
+    return False
+
+
+def qa_documents_matching_refs(qa_index: dict[str, Any], refs: list[str]) -> list[dict[str, Any]]:
+    if not refs:
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for doc in qa_index.get("documents", []):
+        if not isinstance(doc, dict):
+            continue
+        if any(qa_ref_matches_document(ref, doc) for ref in refs):
+            doc_id = str(doc.get("id", ""))
+            if doc_id and doc_id not in seen:
+                seen.add(doc_id)
+                result.append(doc)
+    return result
+
+
+QA_TOPIC_STOP_TOKENS = {
+    "fc",
+    "module",
+    "moudle",
+    "smoke",
+    "qa",
+    "test",
+    "case",
+    "testcase",
+    "projectef",
+    "trunk",
+    "design",
+    "new",
+    "xmind",
+    "md",
+    "ui",
+    "gameplay",
+    "fishing",
+    "items",
+    "progression",
+    "功能",
+    "系统",
+    "测试",
+    "用例",
+    "设计",
+    "文档",
+    "策划",
+    "界面",
+    "交互",
+    "模块",
+    "关卡",
+    "系统关卡",
+    "功能文档",
+    "策划文档",
+    "测试用例",
+    "音效",
+    "音频",
+    "声音",
+    "制作",
+    "配置",
+    "调试",
+    "入版",
+}
+
+
+def path_stem_text(value: Any) -> str:
+    text = normalize_path(str(value or "")).strip()
+    if not text:
+        return ""
+    return Path(text).stem
+
+
+def qa_topic_tokens(text: str) -> set[str]:
+    normalized = normalize_path(text).lower()
+    normalized = re.sub(r"【[^】]*】|\[[^\]]*\]", " ", normalized)
+    tokens = tokenize(normalized)
+    return {
+        token
+        for token in tokens
+        if token not in QA_TOPIC_STOP_TOKENS
+        and not token.isdigit()
+        and len(token) >= 2
+    }
+
+
+def qa_issue_topic_text(issue: dict[str, Any], evidence: list[dict[str, Any]] | None = None) -> str:
+    parts = [
+        issue.get("summary", ""),
+        issue.get("description", ""),
+        issue.get("system", ""),
+        issue.get("design_area", ""),
+        path_stem_text(issue.get("design_doc", "")),
+    ]
+    for item in evidence or []:
+        parts.extend([
+            item.get("system", ""),
+            item.get("title", ""),
+            item.get("feature", ""),
+            path_stem_text(item.get("doc_path", "")),
+        ])
+    return " ".join(str(part) for part in parts if str(part).strip())
+
+
+def qa_doc_topic_text(doc: dict[str, Any]) -> str:
+    return " ".join(
+        str(part)
+        for part in (
+            doc.get("system", ""),
+            doc.get("title", ""),
+            path_stem_text(doc.get("path", "")),
+            path_stem_text(doc.get("full_path", "")),
+        )
+        if str(part).strip()
+    )
+
+
+def qa_documents_matching_issue_topic(
+    qa_index: dict[str, Any],
+    issue: dict[str, Any],
+    evidence: list[dict[str, Any]] | None = None,
+    limit: int = 2,
+) -> list[dict[str, Any]]:
+    ensure_qa_index_lookup(qa_index)
+    query_text = qa_issue_topic_text(issue, evidence)
+    query_tokens = qa_topic_tokens(query_text)
+    if not query_tokens:
+        return []
+    scored: list[tuple[float, dict[str, Any]]] = []
+    topic_docs = qa_index.get("_topic_docs") if isinstance(qa_index.get("_topic_docs"), list) else []
+    if not topic_docs:
+        topic_docs = [
+            (doc, qa_topic_tokens(qa_doc_topic_text(doc)))
+            for doc in qa_index.get("documents", []) or []
+            if isinstance(doc, dict)
+        ]
+        qa_index["_topic_docs"] = topic_docs
+    for doc, doc_tokens in topic_docs:
+        overlap = query_tokens & doc_tokens
+        if not overlap:
+            continue
+        score = float(len(overlap))
+        if "图鉴" in overlap:
+            score += 3.0
+        if any(token.endswith("图鉴") for token in overlap):
+            score += 2.0
+        if "排行榜" in overlap:
+            score += 3.0
+        if "鱼系统" in overlap:
+            score += 0.6
+        doc_path = normalize_path(str(doc.get("path") or doc.get("full_path") or "")).lower()
+        if "qa/testcase" in doc_path:
+            score += 0.4
+        if score >= 1.4 or "图鉴" in overlap or "排行榜" in overlap:
+            scored.append((score, doc))
+    scored.sort(key=lambda item: (item[0], len(str(item[1].get("path") or ""))), reverse=True)
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _score, doc in scored:
+        doc_id = str(doc.get("id") or doc.get("full_path") or doc.get("path") or "")
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        result.append(doc)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def summarize_qa_path_from_cases(cases: list[dict[str, Any]], fallback_refs: list[str] | None = None, limit: int = 2) -> str:
+    paths: list[str] = []
+    for case in cases:
+        path = str(case.get("doc_path") or case.get("full_path") or "").strip()
+        if path:
+            paths.append(path)
+    if not paths and fallback_refs:
+        paths.extend(str(ref) for ref in fallback_refs if str(ref).strip())
+    deduped = dedupe_keep_order(paths)
+    if not deduped:
+        return ""
+    label = " | ".join(deduped[:limit])
+    if len(deduped) > limit:
+        label += f" | +{len(deduped) - limit} more"
+    return label
+
+
+def qa_ref_path_variants(candidate: str) -> list[str]:
+    normalized = normalize_path(candidate).strip().lstrip("/")
+    if not normalized:
+        return []
+    variants = [normalized]
+    lowered = normalized.lower()
+    trunk_prefix = "projectef_trunk/"
+    if lowered.startswith(trunk_prefix):
+        variants.append(normalized[len(trunk_prefix) :])
+    qa_index = lowered.find("qa/testcase")
+    if qa_index >= 0:
+        variants.append(normalized[qa_index:])
+    return dedupe_keep_order(variants)
+
+
+def qa_name_match_score(target_name: str, file_name: str) -> float:
+    target_stem = Path(target_name).stem
+    file_stem = Path(file_name).stem
+    target_norm = normalize_path(target_stem).lower()
+    file_norm = normalize_path(file_stem).lower()
+    target_flat = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", target_norm)
+    file_flat = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", file_norm)
+    score = 0.0
+    if target_flat and target_flat in file_flat:
+        score += 2.0
+    generic_tokens = globals().get("GENERIC_QA_SYSTEM_TOKENS", set())
+    target_tokens = {token for token in tokenize(target_stem) if token not in generic_tokens}
+    file_tokens = {token for token in tokenize(file_stem) if token not in generic_tokens}
+    if target_tokens and file_tokens:
+        overlap = target_tokens & file_tokens
+        score += len(overlap) / max(1, len(target_tokens))
+        if "fc" in target_tokens and "fc" in file_tokens:
+            score += 0.6
+        if "module" in target_tokens and "module" in file_tokens:
+            score += 0.4
+    return score
+
+
+def qa_fuzzy_existing_path(path: Path) -> str:
+    if path.exists():
+        return str(path)
+    parent = path.parent
+    target_name = path.name
+    if not target_name or not parent.exists():
+        return ""
+    scored: list[tuple[float, str]] = []
+    try:
+        children = list(parent.iterdir())
+    except Exception:
+        return ""
+    for child in children:
+        if not child.is_file() or child.suffix.lower() not in QA_PATH_EXTENSIONS:
+            continue
+        score = qa_name_match_score(target_name, child.name)
+        if score >= 0.65:
+            scored.append((score, str(child)))
+    if not scored:
+        return ""
+    scored.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+    return scored[0][1]
+
+
+def qa_ref_existing_paths(ref: str, design_root: Path | None = None) -> list[Path]:
+    candidates: list[Path] = []
+    for variant in qa_ref_path_variants(ref):
+        path = Path(variant)
+        candidates.append(path)
+        if design_root is None:
+            continue
+        bases = [design_root, design_root.parent]
+        for base in bases:
+            candidates.append(base / variant)
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in candidates:
+        key = normalize_path(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def qa_ref_open_target(ref: str, design_root: Path | None = None) -> str:
+    value = clean_text(str(ref or "")).strip()
+    if not value:
+        return ""
+    url_match = re.search(r"https?://[^\s<>\"]+", value)
+    if url_match:
+        return url_match.group(0).strip(" \t\r\n，,；;。.)]】>\"'")
+    path_refs = extract_path_like_qa_refs(value) or [value]
+    for candidate in path_refs:
+        candidate = candidate.strip(" \t\r\n，,；;。.)]】>\"'")
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.exists():
+            return str(path)
+        for possible_path in qa_ref_existing_paths(candidate, design_root):
+            fuzzy_path = qa_fuzzy_existing_path(possible_path)
+            if fuzzy_path:
+                return fuzzy_path
+        if design_root is not None:
+            normalized = normalize_path(candidate).lstrip("/")
+            root_candidate = design_root / normalized
+            if root_candidate.exists():
+                return str(root_candidate)
+            if normalized.lower().startswith("workspace4acceptance/"):
+                root_candidate = design_root / normalized
+                if root_candidate.exists():
+                    return str(root_candidate)
+        if any(candidate.lower().endswith(ext) for ext in QA_PATH_EXTENSIONS):
+            return candidate
+    return ""
+
+
+def first_qa_open_target(cases: list[dict[str, Any]], fallback_refs: list[str] | None = None, design_root: Path | None = None) -> str:
+    for case in cases:
+        full_path = str(case.get("full_path") or "").strip()
+        if full_path and Path(full_path).exists():
+            return full_path
+    for ref in fallback_refs or []:
+        target = qa_ref_open_target(str(ref), design_root)
+        if target:
+            return target
+    return ""
+
+
+def evidence_affinity_for_qa_case(case: dict[str, Any], evidence: dict[str, Any]) -> float:
+    if not evidence:
+        return 0.0
+    evidence_text = " ".join(
+        str(evidence.get(key, ""))
+        for key in ("doc_path", "title", "locator", "feature", "evidence", "text")
+    )
+    evidence_tokens = tokenize(evidence_text)
+    case_affinity_text = " ".join(
+        str(part)
+        for part in (
+            case.get("section", ""),
+            case.get("feature_point", ""),
+            case.get("test_point", ""),
+            " ".join(case.get("operation_steps") or []),
+            case.get("expected_result", ""),
+            " ".join(case.get("source_refs") or []),
+        )
+    )
+    case_tokens = tokenize(case_affinity_text)
+    if not evidence_tokens or not case_tokens:
+        overlap_score = 0.0
+    else:
+        overlap_score = min(0.5, len(evidence_tokens & case_tokens) / max(8, min(len(evidence_tokens), len(case_tokens))))
+    refs = case.get("source_refs") or case.get("design_refs") or []
+    refs_text = normalize_path(" ".join(str(ref) for ref in refs)).lower()
+    doc_stem = Path(str(evidence.get("doc_path", ""))).stem.lower()
+    stem_score = 0.0
+    if doc_stem and doc_stem in refs_text:
+        stem_score += 0.45
+    for token in tokenize(doc_stem):
+        if token in refs_text:
+            stem_score += 0.08
+    base_score = overlap_score + min(0.45, stem_score)
+    system_score = 0.05 if base_score > 0 and case.get("system") and str(case.get("system")) in evidence_text else 0.0
+    return min(1.0, base_score + system_score)
+
+
+GENERIC_QA_SYSTEM_TOKENS = {
+    "系统",
+    "功能",
+    "模块",
+    "玩法",
+    "测试",
+    "用例",
+    "验收",
+    "checklist",
+}
+
+
+def qa_document_system_matches_issue(doc: dict[str, Any], query: str, evidence: list[dict[str, Any]]) -> bool:
+    system = str(doc.get("system") or "").strip()
+    if not system:
+        return True
+    hay = " ".join(
+        [query]
+        + [
+            " ".join(
+                str(item.get(key, ""))
+                for key in ("doc_path", "title", "feature", "evidence", "text", "system")
+            )
+            for item in evidence
+        ]
+    )
+    hay_norm = normalize_path(hay).lower()
+    system_norm = normalize_path(system).lower()
+    if system_norm and system_norm in hay_norm:
+        return True
+    system_tokens = {
+        token
+        for token in tokenize(system)
+        if token not in GENERIC_QA_SYSTEM_TOKENS and len(token) >= 2
+    }
+    if not system_tokens:
+        return True
+    hay_tokens = tokenize(hay)
+    return bool(system_tokens & hay_tokens)
+
+
+def qa_priority_sort_value(case: dict[str, Any]) -> int:
+    priority = str(case.get("priority") or "").upper()
+    if priority.startswith("P") and priority[1:].isdigit():
+        return int(priority[1:])
+    return 9
+
+
+def rank_qa_cases_for_issue(
+    issue: dict[str, Any],
+    qa_index: dict[str, Any],
+    evidence: list[dict[str, Any]] | None = None,
+    limit: int = 24,
+) -> list[dict[str, Any]]:
+    if not qa_index:
+        return []
+    ensure_qa_index_lookup(qa_index)
+    evidence = evidence or []
+    linked_qa_text = " ".join(
+        " ".join(str(item.get(key, "")) for key in ("key", "summary", "status", "relation"))
+        for item in (issue.get("qa_design_issues") or [])
+        if isinstance(item, dict)
+    )
+    qa_detail_text = " ".join(
+        " ".join(
+            [
+                str(item.get("key", "")),
+                str(item.get("summary", "")),
+                " ".join(str(ref) for ref in item.get("refs") or []),
+            ]
+        )
+        for item in (issue.get("qa_design_details") or [])
+        if isinstance(item, dict)
+    )
+    query = " ".join(
+        str(issue.get(key, ""))
+        for key in ("key", "summary", "description", "components", "labels", "qa_doc_refs")
+    ) + " " + linked_qa_text + " " + qa_detail_text
+    story_keys = set(extract_story_keys(query))
+    query_tokens = tokenize(query)
+    docs_by_id = {doc.get("id"): doc for doc in qa_index.get("documents", [])}
+    refs = [str(item) for item in issue.get("qa_doc_refs") or []]
+    explicit_docs = qa_documents_matching_refs(qa_index, refs)
+    explicit_doc_ids = {doc.get("id") for doc in explicit_docs if doc.get("id")}
+    has_explicit_qa_refs = bool(refs)
+    if has_explicit_qa_refs and not explicit_doc_ids and not story_keys:
+        return []
+    by_story = qa_index.get("by_story") if isinstance(qa_index.get("by_story"), dict) else {}
+    story_doc_ids: set[str] = set()
+    story_case_ids: set[str] = set()
+    for key in story_keys:
+        entry = by_story.get(key) or by_story.get(str(key).upper()) or {}
+        if not isinstance(entry, dict):
+            continue
+        story_doc_ids.update(str(doc_id) for doc_id in entry.get("doc_ids") or [] if str(doc_id))
+        story_case_ids.update(str(case_id) for case_id in entry.get("case_ids") or [] if str(case_id))
+    if explicit_doc_ids:
+        candidate_cases = qa_cases_for_doc_ids(qa_index, {str(doc_id) for doc_id in explicit_doc_ids if doc_id})
+    elif story_case_ids:
+        case_by_id = qa_index.get("_case_by_id") if isinstance(qa_index.get("_case_by_id"), dict) else {}
+        candidate_cases = [case_by_id[case_id] for case_id in story_case_ids if case_id in case_by_id]
+    elif story_doc_ids:
+        candidate_cases = qa_cases_for_doc_ids(qa_index, story_doc_ids)
+    else:
+        return []
+    ranked: list[dict[str, Any]] = []
+    for case in candidate_cases:
+        if not isinstance(case, dict):
+            continue
+        score = 0.0
+        source_bits: list[str] = []
+        case_story_keys = set(case.get("story_keys") or [])
+        if story_keys and story_keys & case_story_keys:
+            score += 1.0
+            source_bits.append("StoryKey")
+        doc = docs_by_id.get(case.get("doc_id", ""), {})
+        if explicit_doc_ids:
+            if case.get("doc_id") not in explicit_doc_ids:
+                continue
+            score += 2.0
+            source_bits.append("JiraQARef")
+        elif refs and any(qa_ref_matches_document(ref, doc) for ref in refs):
+            score += 1.0
+            source_bits.append("JiraQARef")
+        elif not story_keys and not qa_document_system_matches_issue(doc, query, evidence):
+            continue
+        case_tokens = set(case.get("tokens") or [])
+        if query_tokens and case_tokens:
+            overlap = query_tokens & case_tokens
+            if overlap:
+                score += min(0.35, len(overlap) / max(10, min(len(query_tokens), len(case_tokens))))
+                source_bits.append("Text")
+        affinity = 0.0
+        if evidence:
+            affinity = max(evidence_affinity_for_qa_case(case, item) for item in evidence)
+            score += affinity
+            if affinity >= 0.08:
+                source_bits.append("DesignRef")
+        if case.get("kind") == "Smoke":
+            score += 0.06
+        if qa_priority_sort_value(case) == 0:
+            score += 0.04
+
+        has_strong_link = "StoryKey" in source_bits or "JiraQARef" in source_bits
+        if evidence and not has_strong_link and affinity < 0.12:
+            continue
+        min_score = 0.18 if has_strong_link else (0.28 if evidence else 0.34)
+        if score < min_score:
+            continue
+        item = dict(case)
+        item["qa_match_score"] = round(score, 4)
+        item["qa_source"] = "+".join(dict.fromkeys(source_bits)) or "Weak"
+        ranked.append(item)
+
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("qa_match_score", 0)),
+            item.get("kind") == "Smoke",
+            -qa_priority_sort_value(item),
+            item.get("status") == "Open",
+        ),
+        reverse=True,
+    )
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in ranked:
+        case_id = str(item.get("id", ""))
+        if case_id in seen:
+            continue
+        seen.add(case_id)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def summarize_qa_cases(cases: list[dict[str, Any]], compact: bool = True) -> str:
+    if not cases:
+        return "No QA"
+    total = len(cases)
+    done = sum(1 for case in cases if case.get("status") == "Done")
+    open_count = total - done
+    smoke = sum(1 for case in cases if case.get("kind") == "Smoke")
+    if compact:
+        if smoke:
+            return f"{total} cases / {smoke} smoke"
+        return f"{total} cases"
+    return f"{total} cases, Done {done}, Open {open_count}, Smoke {smoke}"
+
+
+def summarize_qa_method(cases: list[dict[str, Any]], limit: int = 1) -> str:
+    if not cases:
+        return ""
+
+    def one_line(value: Any, max_len: int) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 3].rstrip() + "..."
+
+    chunks: list[str] = []
+    for case in cases[:limit]:
+        steps = " -> ".join(one_line(step, 60) for step in (case.get("operation_steps") or []) if str(step).strip())
+        parts = [
+            ("F", one_line(case.get("feature_point", ""), 50)),
+            ("T", one_line(case.get("test_point", ""), 90)),
+            ("Steps", one_line(steps, 110)),
+            ("Expected", one_line(case.get("expected_result", ""), 90)),
+        ]
+        chunk = " | ".join(f"{label}: {value}" for label, value in parts if value)
+        if chunk:
+            chunks.append(chunk)
+    if len(cases) > limit:
+        chunks.append(f"+{len(cases) - limit} more")
+    return " ; ".join(chunks)
 
 
 def infer_feature_name(title: str, text: str) -> str:
@@ -675,14 +2267,63 @@ def load_index() -> dict[str, Any]:
 
 
 def save_index(index: dict[str, Any]) -> None:
-    INDEX_PATH.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    INDEX_PATH.write_text(json.dumps(serializable_index(index), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def serializable_index(index: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in index.items() if not str(key).startswith("_")}
+
+
+def load_jira_issue_cache() -> dict[str, Any]:
+    if not JIRA_CACHE_PATH.exists():
+        return {}
+    data = json.loads(JIRA_CACHE_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {}
+    issues = data.get("issues")
+    if not isinstance(issues, list):
+        return {}
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    return {"metadata": metadata, "issues": issues}
+
+
+def save_jira_issue_cache(
+    issues: list[dict[str, Any]],
+    *,
+    jira_url: str,
+    jql: str,
+    source: str,
+) -> dict[str, Any]:
+    safe_issues = json.loads(json.dumps(issues, ensure_ascii=False, default=str))
+    for issue in safe_issues:
+        if isinstance(issue, dict):
+            normalize_issue_match_state(issue)
+    matched_count = sum(1 for issue in safe_issues if isinstance(issue, dict) and issue_has_persisted_match(issue))
+    metadata = {
+        "version": JIRA_CACHE_VERSION,
+        "generated_at": now_stamp(),
+        "jira_url": jira_url,
+        "jql": jql,
+        "source": source,
+        "issue_count": len(safe_issues),
+        "matched_count": matched_count,
+        "unmatched_count": max(0, len(safe_issues) - matched_count),
+        "note": "Local Jira cache only. Refresh manually when you need current status, assignee, links, or QA refs.",
+    }
+    payload = {
+        "version": JIRA_CACHE_VERSION,
+        "metadata": metadata,
+        "issues": safe_issues,
+    }
+    JIRA_CACHE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return metadata
 
 
 def save_snapshot(index: dict[str, Any]) -> Path:
     SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     path = SNAPSHOT_DIR / f"audio_requirement_index_{stamp}.json"
-    path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(serializable_index(index), ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
@@ -881,6 +2522,7 @@ def default_config() -> dict[str, Any]:
         "jira_cookie": "",
         "jql": "assignee = yupeng AND statusCategory != Done ORDER BY updated DESC",
         "jql_limit": "500",
+        "jira_qa_fields": [],
         "ollama_url": DEFAULT_OLLAMA_URL,
         "local_model": DEFAULT_LOCAL_MODEL,
     }
@@ -893,7 +2535,16 @@ def load_config() -> dict[str, Any]:
     try:
         loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
-            config.update({k: str(v) for k, v in loaded.items() if k in config})
+            for key, value in loaded.items():
+                if key not in config:
+                    continue
+                if key == "jira_qa_fields":
+                    if isinstance(value, list):
+                        config[key] = [str(item).strip() for item in value if str(item).strip()]
+                    elif isinstance(value, str):
+                        config[key] = [item.strip() for item in re.split(r"[,;\s]+", value) if item.strip()]
+                else:
+                    config[key] = str(value)
     except Exception:
         pass
     return config
@@ -903,8 +2554,36 @@ def save_config(config: dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def ensure_design_index_lookup(index: dict[str, Any]) -> dict[str, list[tuple[str, int]]]:
+    lookup = index.get("_token_lookup")
+    if isinstance(lookup, dict):
+        return lookup
+    built: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    token_sets: dict[str, list[set[str]]] = {}
+    for source_name in ("requirements", "chunks"):
+        records = index.get(source_name, []) or []
+        source_token_sets: list[set[str]] = []
+        for record_index, record in enumerate(records):
+            if not isinstance(record, dict):
+                source_token_sets.append(set())
+                continue
+            record_tokens = {str(token) for token in record.get("tokens") or [] if str(token)}
+            source_token_sets.append(record_tokens)
+            for token in record_tokens:
+                if isinstance(token, str) and token:
+                    built[token].append((source_name, record_index))
+        token_sets[source_name] = source_token_sets
+    index["_token_lookup"] = dict(built)
+    index["_token_sets"] = token_sets
+    return index["_token_lookup"]
+
+
 def match_score(query_tokens: set[str], record: dict[str, Any]) -> float:
     tokens = set(record.get("tokens") or [])
+    return match_score_with_tokens(query_tokens, record, tokens)
+
+
+def match_score_with_tokens(query_tokens: set[str], record: dict[str, Any], tokens: set[str]) -> float:
     if not query_tokens or not tokens:
         return 0.0
     overlap = query_tokens & tokens
@@ -920,20 +2599,62 @@ def match_score(query_tokens: set[str], record: dict[str, Any]) -> float:
 def rank_evidence(issue: dict[str, Any], index: dict[str, Any], limit: int = 12) -> list[dict[str, Any]]:
     query = " ".join(str(issue.get(key, "")) for key in ("key", "summary", "description"))
     q_tokens = tokenize(query)
-    candidates: list[dict[str, Any]] = []
-    for source_name in ("requirements", "chunks"):
-        for record in index.get(source_name, []):
-            score = match_score(q_tokens, record)
-            if score <= 0:
-                continue
-            item = dict(record)
-            item["match_score"] = score
-            item["source"] = source_name
-            candidates.append(item)
-    candidates.sort(key=lambda item: (item["match_score"], item.get("audio_score", 0)), reverse=True)
+    if not q_tokens:
+        return []
+    lookup = ensure_design_index_lookup(index)
+    token_sets_by_source = index.get("_token_sets") if isinstance(index.get("_token_sets"), dict) else {}
+    token_counts = [
+        (token, len(lookup.get(token, [])))
+        for token in q_tokens
+        if lookup.get(token)
+    ]
+    if not token_counts:
+        return []
+    chosen_tokens = [(token, count) for token, count in token_counts if count <= 2500]
+    if not chosen_tokens:
+        chosen_tokens = sorted(token_counts, key=lambda item: item[1])[:5]
+    candidate_weights: dict[tuple[str, int], float] = defaultdict(float)
+    for token, count in chosen_tokens:
+        refs = lookup.get(token, [])
+        weight = 1.0 / max(1.0, count ** 0.5)
+        for ref in refs:
+            candidate_weights[ref] += weight
+    if len(candidate_weights) > 1400:
+        candidate_refs = [
+            ref
+            for ref, _weight in sorted(candidate_weights.items(), key=lambda item: item[1], reverse=True)[:1400]
+        ]
+    else:
+        candidate_refs = list(candidate_weights.keys())
+    if not candidate_refs:
+        return []
+    scored_candidates: list[tuple[float, float, str, int]] = []
+    for source_name, record_index in candidate_refs:
+        records = index.get(source_name, []) or []
+        if record_index < 0 or record_index >= len(records):
+            continue
+        record = records[record_index]
+        if not isinstance(record, dict):
+            continue
+        source_token_sets = token_sets_by_source.get(source_name, []) if isinstance(token_sets_by_source, dict) else []
+        record_tokens = source_token_sets[record_index] if record_index < len(source_token_sets) else set(record.get("tokens") or [])
+        score = match_score_with_tokens(q_tokens, record, record_tokens)
+        if score <= 0:
+            continue
+        scored_candidates.append((score, float(record.get("audio_score", 0) or 0), source_name, record_index))
+    scored_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     deduped: list[dict[str, Any]] = []
     seen = set()
-    for item in candidates:
+    for score, _audio_score, source_name, record_index in scored_candidates:
+        records = index.get(source_name, []) or []
+        if record_index < 0 or record_index >= len(records):
+            continue
+        record = records[record_index]
+        if not isinstance(record, dict):
+            continue
+        item = dict(record)
+        item["match_score"] = score
+        item["source"] = source_name
         key = (item.get("doc_path"), item.get("locator"))
         if key in seen:
             continue
@@ -1032,10 +2753,90 @@ def split_multi_values(value: Any) -> list[str]:
     return [item for item in (part.strip() for part in raw) if item]
 
 
-def issue_link_labels(values: Any) -> str:
+def dedupe_keep_order(values: Iterable[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = clean_text(str(value or ""))
+        if not text:
+            continue
+        key = normalize_path(text).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def dedupe_refs_prefer_full_paths(values: Iterable[Any]) -> list[str]:
+    result: list[str] = []
+    for value in dedupe_keep_order(values):
+        norm = normalize_path(value).lower()
+        if any(norm != normalize_path(existing).lower() and norm in normalize_path(existing).lower() for existing in result):
+            continue
+        result.append(value)
+    return result
+
+
+def issue_has_persisted_match(issue: dict[str, Any]) -> bool:
+    if str(issue.get("match_status") or "").strip() == MATCH_STATUS_MATCHED:
+        return True
+    design_area = str(issue.get("design_area") or "").strip()
+    return bool(issue.get("evidence")) or bool(issue.get("design_doc")) or design_area not in {
+        "",
+        NO_EVIDENCE_LABEL,
+        UNMATCHED_DESIGN_LABEL,
+    }
+
+
+def normalize_issue_match_state(issue: dict[str, Any]) -> None:
+    if not str(issue.get("match_status") or "").strip():
+        issue["match_status"] = MATCH_STATUS_MATCHED if issue_has_persisted_match(issue) else MATCH_STATUS_NOT_MATCHED
+    if (
+        issue.get("match_status") == MATCH_STATUS_NOT_MATCHED
+        and str(issue.get("design_area") or "").strip() in {"", NO_EVIDENCE_LABEL}
+        and not issue.get("evidence")
+        and not issue.get("design_doc")
+    ):
+        issue["design_area"] = UNMATCHED_DESIGN_LABEL
+
+
+def jira_revision(issue: dict[str, Any]) -> str:
+    return str(issue.get("updated") or "").strip()
+
+
+def jira_match_input_signature(issue: dict[str, Any]) -> str:
+    payload = {
+        key: issue.get(key)
+        for key in JIRA_MATCH_INPUT_FIELDS
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha1(clean_text(text).encode("utf-8", errors="ignore")).hexdigest()
+
+
+def jira_issue_unchanged(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    old_revision = jira_revision(existing)
+    new_revision = jira_revision(incoming)
+    return bool(old_revision and new_revision and old_revision == new_revision)
+
+
+def compact_jira_issue_record(issue: dict[str, Any], relation: str = "") -> dict[str, str]:
+    fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+    status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+    issue_type = fields.get("issuetype") if isinstance(fields.get("issuetype"), dict) else {}
+    return {
+        "key": str(issue.get("key") or "").strip(),
+        "summary": str(fields.get("summary") or issue.get("summary") or "").strip(),
+        "status": str(status.get("name") or "").strip(),
+        "issue_type": str(issue_type.get("name") or "").strip(),
+        "relation": relation,
+    }
+
+
+def linked_issue_records(values: Any) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
     if not isinstance(values, list):
-        return ""
-    labels: list[str] = []
+        return records
     for link in values:
         if not isinstance(link, dict):
             continue
@@ -1043,17 +2844,49 @@ def issue_link_labels(values: Any) -> str:
         if isinstance(link.get("type"), dict):
             link_type = str(link["type"].get("name") or link["type"].get("outward") or link["type"].get("inward") or "").strip()
         linked = link.get("outwardIssue") or link.get("inwardIssue")
-        if not isinstance(linked, dict):
-            continue
-        key = str(linked.get("key") or "").strip()
-        fields = linked.get("fields") if isinstance(linked.get("fields"), dict) else {}
-        status = ""
-        if isinstance(fields.get("status"), dict):
-            status = str(fields["status"].get("name") or "").strip()
-        label = " ".join(part for part in (link_type, key, status) if part)
+        if isinstance(linked, dict):
+            records.append(compact_jira_issue_record(linked, link_type))
+    return records
+
+
+def subtask_issue_records(values: Any) -> list[dict[str, str]]:
+    if not isinstance(values, list):
+        return []
+    return [compact_jira_issue_record(item, "Subtask") for item in values if isinstance(item, dict)]
+
+
+def issue_link_labels(values: Any) -> str:
+    if not isinstance(values, list):
+        return ""
+    labels: list[str] = []
+    for record in linked_issue_records(values):
+        label = " ".join(part for part in (record.get("relation"), record.get("key"), record.get("status")) if part)
         if label:
             labels.append(label)
     return "; ".join(labels)
+
+
+def all_related_jira_issue_records(fields: dict[str, Any]) -> list[dict[str, str]]:
+    records = linked_issue_records(fields.get("issuelinks"))
+    records.extend(subtask_issue_records(fields.get("subtasks")))
+    parent = fields.get("parent")
+    if isinstance(parent, dict):
+        records.append(compact_jira_issue_record(parent, "Parent"))
+    return [item for item in records if item.get("key")]
+
+
+def looks_like_qa_design_issue(record: dict[str, Any]) -> bool:
+    hay = clean_text(
+        " ".join(
+            str(record.get(key, ""))
+            for key in ("key", "summary", "issue_type", "relation", "status")
+        )
+    ).lower()
+    return any(hint.lower() in hay for hint in QA_DESIGN_ISSUE_HINTS)
+
+
+def extract_qa_design_issue_refs(fields: dict[str, Any]) -> list[dict[str, str]]:
+    return [record for record in all_related_jira_issue_records(fields) if looks_like_qa_design_issue(record)]
 
 
 def issue_version_label(issue: dict[str, Any]) -> str:
@@ -1077,10 +2910,10 @@ def issue_version_label(issue: dict[str, Any]) -> str:
 
 def design_area_from_doc_path(doc_path: str) -> str:
     if not doc_path:
-        return "NoEvidence"
+        return NO_EVIDENCE_LABEL
     parts = [part for part in re.split(r"[\\/]+", doc_path) if part]
     if not parts:
-        return "NoEvidence"
+        return NO_EVIDENCE_LABEL
     anchors = {"策划文档", "功能文档", "表格文档", "系统文档"}
     for idx, part in enumerate(parts):
         if part in anchors and idx + 1 < len(parts):
@@ -1594,6 +3427,7 @@ def parse_issue_from_json(data: dict[str, Any]) -> dict[str, Any]:
     description = fields.get("description") or ""
     if isinstance(description, dict):
         description = json.dumps(description, ensure_ascii=False)
+    qa_design_issues = extract_qa_design_issue_refs(fields)
     return {
         "key": data.get("key", ""),
         "summary": fields.get("summary", ""),
@@ -1611,6 +3445,8 @@ def parse_issue_from_json(data: dict[str, Any]) -> dict[str, Any]:
         "issue_links": issue_link_labels(fields.get("issuelinks")),
         "fix_versions": join_names(fields.get("fixVersions")),
         "versions": join_names(fields.get("versions")),
+        "qa_doc_refs": extract_jira_qa_refs(fields),
+        "qa_design_issues": qa_design_issues,
         "source": "Jira REST",
         "url": "",
     }
@@ -1638,6 +3474,7 @@ def parse_issue_from_html(body: str, key: str = "") -> dict[str, Any]:
         "status": "",
         "assignee": "",
         "updated": "",
+        "qa_doc_refs": split_possible_jira_qa_refs(description),
         "source": "Jira HTML",
         "url": "",
     }
@@ -1666,6 +3503,7 @@ def issue_from_manual_text(key: str, text: str) -> dict[str, Any]:
         "status": "",
         "assignee": "",
         "updated": "",
+        "qa_doc_refs": split_possible_jira_qa_refs(text),
         "source": "Manual text",
         "url": "",
     }
@@ -1715,6 +3553,17 @@ def parse_issue_from_csv_row(row: dict[str, str], fallback_index: int) -> dict[s
         "issue_links": csv_value(row, ["Linked Issues", "Issue Links", "Issue links", "关联问题", "链接问题"]),
         "fix_versions": csv_value(row, ["Fix Version/s", "Fix versions", "Fix Version", "修复版本", "目标版本"]),
         "versions": csv_value(row, ["Affects Version/s", "Affects versions", "Affects Version", "影响版本", "版本"]),
+        "qa_doc_refs": split_possible_jira_qa_refs(
+            " ".join(
+                csv_value(row, names)
+                for names in (
+                    ["QA", "Smoke", "Test Case", "Checklist", "冒烟测试", "测试用例", "验收文档"],
+                    ["QA Path", "QA File", "QA Doc", "QA Document", "Test Case Design", "Test Case Path", "Acceptance Checklist"],
+                    ["测试用例设计", "测试用例位置", "用例设计", "用例位置", "验收用例", "验收文档"],
+                    ["Description", "描述", "说明"],
+                )
+            )
+        ),
         "source": "Jira CSV",
         "url": "",
     }
@@ -1746,6 +3595,7 @@ class TriageGui(tk.Tk):
         self.jira_cookie_var = tk.StringVar(value=config["jira_cookie"])
         self.jql_var = tk.StringVar(value=config["jql"])
         self.jql_limit_var = tk.StringVar(value=config.get("jql_limit", "500"))
+        self.jira_qa_fields: list[str] = list(config.get("jira_qa_fields") or [])
         self.issue_key_var = tk.StringVar(value="PROEF-9209")
         self.ollama_url_var = tk.StringVar(value=config["ollama_url"])
         self.local_model_var = tk.StringVar(value=config["local_model"])
@@ -1771,11 +3621,19 @@ class TriageGui(tk.Tk):
         self.status_var = tk.StringVar(value="Ready. Scan Design or Load Index first.")
         self.summary_var = tk.StringVar(value="")
         self.selected_summary_var = tk.StringVar(value="Select a Jira issue to view matched design evidence.")
+        self.qa_path_var = tk.StringVar(value="QA Path: -")
         self.detail_visible_var = tk.BooleanVar(value=False)
 
         self.index: dict[str, Any] = {}
+        self.qa_index: dict[str, Any] = {}
         self.latest_diff: dict[str, Any] = {}
         self.issues: list[dict[str, Any]] = []
+        self.jira_cache_meta: dict[str, Any] = {}
+        self.jira_issue_detail_cache: dict[str, dict[str, Any]] = {}
+        self.matching_issues = False
+        self.match_index = 0
+        self.match_after_complete = None
+        self.scan_cancel_requested = False
         self.visible_issue_iids: list[str] = []
         self.system_filter_combo: ttk.Combobox | None = None
         self.version_filter_combo: ttk.Combobox | None = None
@@ -1788,6 +3646,8 @@ class TriageGui(tk.Tk):
         self.configure_style()
         self.build_ui()
         self.try_load_index_silent()
+        self.try_load_qa_index_silent()
+        self.try_load_jira_cache_silent()
 
     def configure_style(self) -> None:
         style = ttk.Style(self)
@@ -1858,11 +3718,14 @@ class TriageGui(tk.Tk):
         self.entry(design_panel, "Design Root", self.design_root_var, 520).pack(side=tk.LEFT, padx=(10, 8), pady=10)
         self.button(design_panel, "Browse", self.browse_design_root).pack(side=tk.LEFT, padx=4)
         self.button(design_panel, "Scan Design", self.scan_design_async, bg="#2f6f5e").pack(side=tk.LEFT, padx=8)
+        self.button(design_panel, "Scan QA", self.scan_qa_async, bg="#2f6f5e").pack(side=tk.LEFT, padx=4)
         self.button(design_panel, "Scan + Diff Changes", self.scan_diff_async, bg="#8867d8").pack(side=tk.LEFT, padx=4)
+        self.button(design_panel, "Cancel Scan", self.cancel_scan_clicked, bg="#6b3440").pack(side=tk.LEFT, padx=4)
         self.button(design_panel, "Compare Latest", self.compare_latest_snapshots).pack(side=tk.LEFT, padx=4)
         self.button(design_panel, "Load Index", self.load_index_clicked).pack(side=tk.LEFT, padx=4)
         self.button(design_panel, "Open Diff", self.open_latest_diff).pack(side=tk.LEFT, padx=4)
         self.button(design_panel, "Open Index", lambda: os.startfile(str(INDEX_PATH)) if INDEX_PATH.exists() else None).pack(side=tk.LEFT, padx=4)
+        self.button(design_panel, "Open QA Index", lambda: os.startfile(str(QA_INDEX_PATH)) if QA_INDEX_PATH.exists() else None).pack(side=tk.LEFT, padx=4)
         self.button(design_panel, "Open Reports", lambda: os.startfile(str(REPORT_DIR))).pack(side=tk.LEFT, padx=4)
 
         jira_panel = self.panel(self)
@@ -1875,9 +3738,12 @@ class TriageGui(tk.Tk):
         self.button(jira_panel, "Restart Dedicated Jira", self.restart_dedicated_jira_browser_clicked, bg="#315577").pack(side=tk.LEFT, padx=4)
         self.button(jira_panel, "Use Browser Login", self.use_browser_login_clicked).pack(side=tk.LEFT, padx=4)
         self.button(jira_panel, "Close Edge + Login", self.close_edge_then_login_clicked, bg="#8d5f32").pack(side=tk.LEFT, padx=4)
+        self.button(jira_panel, "Detect QA Fields", self.detect_jira_qa_fields_clicked).pack(side=tk.LEFT, padx=4)
         self.button(jira_panel, "Sync Issue", self.sync_issue_clicked).pack(side=tk.LEFT, padx=4)
         self.button(jira_panel, "Import Jira CSV", self.import_jira_csv_clicked).pack(side=tk.LEFT, padx=4)
         self.button(jira_panel, "Paste Jira Text", self.paste_jira_text).pack(side=tk.LEFT, padx=4)
+        self.button(jira_panel, "Load Jira Cache", self.load_jira_cache_clicked).pack(side=tk.LEFT, padx=4)
+        self.button(jira_panel, "Open Jira Cache", lambda: os.startfile(str(JIRA_CACHE_PATH)) if JIRA_CACHE_PATH.exists() else None).pack(side=tk.LEFT, padx=4)
 
         jql_panel = self.panel(self)
         jql_panel.pack(fill=tk.X, padx=16, pady=(0, 8))
@@ -1904,6 +3770,8 @@ class TriageGui(tk.Tk):
         self.button(toolbar, "Clear Filters", self.clear_filters).pack(side=tk.LEFT, padx=4)
         self.button(toolbar, "Match All Issues", self.match_all_issues, bg="#2f6f5e").pack(side=tk.LEFT, padx=4)
         self.button(toolbar, "Open Evidence File", self.open_selected_evidence).pack(side=tk.LEFT, padx=4)
+        self.button(toolbar, "Show QA Cases", self.show_selected_qa_cases).pack(side=tk.LEFT, padx=4)
+        self.button(toolbar, "Open QA Path", self.open_selected_qa_file).pack(side=tk.LEFT, padx=4)
         self.button(toolbar, "Copy Jira Reply Draft", self.copy_jira_reply).pack(side=tk.LEFT, padx=4)
         self.button(toolbar, "Export Report", self.export_report).pack(side=tk.LEFT, padx=4)
 
@@ -1933,7 +3801,7 @@ class TriageGui(tk.Tk):
 
         top = tk.Frame(paned, bg=BG)
         paned.add(top, minsize=260, height=380)
-        columns = ("key", "required", "start", "ready", "system", "version", "design", "dependency", "confidence", "status", "summary", "evidence")
+        columns = ("key", "required", "start", "ready", "system", "version", "design", "dependency", "qa_status", "qa_path", "confidence", "status", "summary", "evidence")
         self.issue_tree = ttk.Treeview(top, columns=columns, show="headings", selectmode="extended")
         headings = {
             "key": "Jira",
@@ -1944,6 +3812,8 @@ class TriageGui(tk.Tk):
             "version": "Version",
             "design": "Design",
             "dependency": "Dependency",
+            "qa_status": "QA Link",
+            "qa_path": "QA Path",
             "confidence": "Conf",
             "status": "Status",
             "summary": "Summary",
@@ -1958,6 +3828,8 @@ class TriageGui(tk.Tk):
             "version": 110,
             "design": 170,
             "dependency": 180,
+            "qa_status": 125,
+            "qa_path": 310,
             "confidence": 65,
             "status": 90,
             "summary": 280,
@@ -1985,6 +3857,11 @@ class TriageGui(tk.Tk):
         self.detail_toggle_button = self.button(bottom_header, "Show Details", self.toggle_detail_panel)
         self.detail_toggle_button.pack(side=tk.RIGHT, padx=(8, 0))
 
+        qa_path_header = tk.Frame(bottom, bg=BG)
+        qa_path_header.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(qa_path_header, textvariable=self.qa_path_var, bg=BG, fg="#8bd6ca", anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.button(qa_path_header, "Open QA Path", self.open_selected_qa_file, bg="#315577").pack(side=tk.RIGHT, padx=(8, 0))
+
         self.detail_frame = tk.Frame(bottom, bg=BG)
         self.detail_text = tk.Text(self.detail_frame, height=7, bg="#101720", fg=INK, insertbackground=INK, relief=tk.FLAT, wrap=tk.WORD)
         detail_y = ttk.Scrollbar(self.detail_frame, orient=tk.VERTICAL, command=self.detail_text.yview)
@@ -1995,12 +3872,12 @@ class TriageGui(tk.Tk):
         self.detail_text.configure(yscrollcommand=detail_y.set)
         self.detail_text.configure(state=tk.DISABLED)
 
-        ev_columns = ("score", "audio", "ready", "type", "path", "locator")
+        ev_columns = ("score", "audio", "ready", "type", "qa", "qa_method", "qa_source", "path", "locator")
         self.evidence_frame = tk.Frame(bottom, bg=BG)
         self.evidence_frame.pack(fill=tk.BOTH, expand=True)
         self.evidence_tree = ttk.Treeview(self.evidence_frame, columns=ev_columns, show="headings", selectmode="browse")
-        ev_headings = {"score": "Match", "audio": "Audio", "ready": "Ready", "type": "Type", "path": "Doc", "locator": "Where"}
-        ev_widths = {"score": 70, "audio": 70, "ready": 110, "type": 110, "path": 450, "locator": 170}
+        ev_headings = {"score": "Match", "audio": "Audio", "ready": "Ready", "type": "Type", "qa": "QA Cases", "qa_method": "QA Method", "qa_source": "QA Source", "path": "Doc", "locator": "Where"}
+        ev_widths = {"score": 70, "audio": 70, "ready": 110, "type": 110, "qa": 140, "qa_method": 560, "qa_source": 130, "path": 420, "locator": 170}
         for col in ev_columns:
             self.evidence_tree.heading(col, text=ev_headings[col])
             self.evidence_tree.column(col, width=ev_widths[col], anchor=tk.W)
@@ -2013,6 +3890,7 @@ class TriageGui(tk.Tk):
         self.evidence_frame.columnconfigure(0, weight=1)
         self.evidence_tree.configure(yscrollcommand=evidence_y.set, xscrollcommand=evidence_x.set)
         self.evidence_tree.bind("<Double-1>", lambda _event: self.open_selected_evidence())
+        self.evidence_tree.bind("<<TreeviewSelect>>", lambda _event: self.update_selected_qa_path_label())
 
         manual_panel = self.panel(self)
         manual_panel.pack(fill=tk.X, padx=16, pady=(0, 8))
@@ -2053,27 +3931,298 @@ class TriageGui(tk.Tk):
             "jira_cookie": "",
             "jql": self.jql_var.get().strip(),
             "jql_limit": self.jql_limit_var.get().strip(),
+            "jira_qa_fields": self.jira_qa_fields,
             "ollama_url": self.ollama_url_var.get().strip(),
             "local_model": self.local_model_var.get().strip(),
         })
+
+    def jira_fields_param(self) -> str:
+        fields = [item.strip() for item in JIRA_SEARCH_FIELDS.split(",") if item.strip()]
+        for field_id in self.jira_qa_fields:
+            field_id = str(field_id).strip()
+            if field_id and field_id not in fields:
+                fields.append(field_id)
+        return ",".join(fields)
+
+    def fetch_issue_json_detail_for_qa(self, key: str) -> dict[str, Any]:
+        key = key.strip().upper()
+        if not key:
+            return {}
+        if key in self.jira_issue_detail_cache:
+            return self.jira_issue_detail_cache[key]
+        base = self.jira_url_var.get().strip() or DEFAULT_JIRA_URL
+        fields = urllib.parse.quote(self.jira_fields_param(), safe=",")
+        if self.jira_cookie_var.get().strip():
+            status, ctype, body = jira_request(
+                base,
+                f"/rest/api/2/issue/{urllib.parse.quote(key)}?fields={fields}",
+                self.jira_cookie_var.get().strip(),
+                timeout=15,
+            )
+            if status != 200 or "json" not in ctype.lower():
+                return {}
+            data = json.loads(body)
+        else:
+            if not cdp_is_available():
+                return {}
+            response = cdp_fetch_jira_url(
+                base,
+                self.jql_var.get().strip(),
+                f"/rest/api/2/issue/{urllib.parse.quote(key)}?fields={fields}",
+                timeout=20,
+            )
+            status = int(response.get("status") or 0)
+            ctype = str(response.get("contentType") or "")
+            if status != 200 or "json" not in ctype.lower():
+                return {}
+            data = json.loads(str(response.get("text") or "{}"))
+        self.jira_issue_detail_cache[key] = data
+        return data
+
+    def enrich_issue_with_qa_design_refs(
+        self,
+        issue: dict[str, Any],
+        fetch_details: bool = True,
+        max_details: int | None = None,
+    ) -> None:
+        design_issues = list(issue.get("qa_design_issues") or [])
+        if not design_issues:
+            issue["qa_doc_refs"] = dedupe_keep_order(issue.get("qa_doc_refs") or [])
+            issue.setdefault("qa_design_details", [])
+            return
+        refs: list[str] = list(issue.get("qa_doc_refs") or [])
+        details: list[dict[str, Any]] = []
+        for detail_index, record in enumerate(design_issues):
+            if not isinstance(record, dict):
+                continue
+            if max_details is not None and detail_index >= max_details:
+                break
+            key = str(record.get("key") or "").strip().upper()
+            if not key:
+                continue
+            detail = {
+                "key": key,
+                "summary": str(record.get("summary") or ""),
+                "status": str(record.get("status") or ""),
+                "relation": str(record.get("relation") or ""),
+                "refs": [],
+                "fetch_status": "not fetched",
+            }
+            if not fetch_details:
+                detail["fetch_status"] = "deferred"
+                details.append(detail)
+                continue
+            data = self.fetch_issue_json_detail_for_qa(key)
+            fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
+            if fields:
+                parsed_refs = extract_jira_qa_refs(fields)
+                refs.extend(parsed_refs)
+                detail["summary"] = str(fields.get("summary") or detail["summary"])
+                status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+                detail["status"] = str(status.get("name") or detail["status"])
+                detail["refs"] = parsed_refs
+                detail["fetch_status"] = "ok"
+            else:
+                detail["fetch_status"] = "unavailable"
+            details.append(detail)
+        issue["qa_doc_refs"] = dedupe_keep_order(refs)
+        issue["qa_design_details"] = details
+        if fetch_details:
+            issue["_qa_details_resolved"] = True
+
+    def detect_jira_qa_fields_clicked(self) -> None:
+        self.save_current_config()
+        base = self.jira_url_var.get().strip() or DEFAULT_JIRA_URL
+        fields_data: Any = None
+        try:
+            if self.jira_cookie_var.get().strip():
+                status, ctype, body = jira_request(base, "/rest/api/2/field", self.jira_cookie_var.get().strip(), timeout=30)
+                if status != 200 or "json" not in ctype.lower():
+                    raise RuntimeError(f"Jira field API failed: HTTP {status} {ctype}")
+                fields_data = json.loads(body)
+            else:
+                if not cdp_is_available():
+                    self.open_dedicated_jira_browser(show_message=True)
+                    return
+                response = cdp_fetch_jira_url(base, self.jql_var.get().strip(), "/rest/api/2/field", timeout=60)
+                status = int(response.get("status") or 0)
+                ctype = str(response.get("contentType") or "")
+                body = str(response.get("text") or "")
+                if status != 200 or "json" not in ctype.lower():
+                    raise RuntimeError(f"Jira field API failed in dedicated browser: HTTP {status} {ctype}")
+                fields_data = json.loads(body)
+        except Exception as exc:
+            messagebox.showerror("Detect QA Fields", str(exc)[:4000])
+            return
+
+        if not isinstance(fields_data, list):
+            messagebox.showinfo("Detect QA Fields", "Jira field API returned an unexpected response.")
+            return
+        detected = [
+            str(field.get("id") or "").strip()
+            for field in fields_data
+            if isinstance(field, dict) and jira_field_matches_qa_hint(field) and str(field.get("id") or "").strip()
+        ]
+        self.jira_qa_fields = sorted(set(self.jira_qa_fields + detected))
+        self.save_current_config()
+        names = [
+            f"{field.get('id')}: {field.get('name')}"
+            for field in fields_data
+            if isinstance(field, dict) and str(field.get("id") or "").strip() in self.jira_qa_fields
+        ]
+        self.status_var.set(f"Detected {len(detected)} QA-related Jira fields. Active extra fields: {len(self.jira_qa_fields)}")
+        messagebox.showinfo(
+            "Detect QA Fields",
+            ("Detected QA-related fields:\n\n" + "\n".join(names[:40])) if names else "No QA-related custom fields found.",
+        )
 
     def try_load_index_silent(self) -> None:
         if INDEX_PATH.exists():
             try:
                 self.index = load_index()
+                ensure_design_index_lookup(self.index)
                 self.update_summary()
                 self.status_var.set(f"Loaded existing index: {INDEX_PATH}")
             except Exception:
                 pass
 
+    def try_load_qa_index_silent(self) -> None:
+        if QA_INDEX_PATH.exists():
+            try:
+                self.qa_index = load_qa_index()
+                self.update_summary()
+                self.status_var.set(f"Loaded existing QA index: {QA_INDEX_PATH}")
+            except Exception:
+                pass
+
+    def try_load_jira_cache_silent(self) -> None:
+        if not JIRA_CACHE_PATH.exists():
+            return
+        try:
+            cache = load_jira_issue_cache()
+            issues = cache.get("issues") or []
+            self.issues = []
+            for issue in issues:
+                if isinstance(issue, dict):
+                    self.add_or_replace_issue(issue, refresh=False)
+            self.jira_cache_meta = cache.get("metadata") or {}
+            if self.qa_index:
+                for issue in self.issues:
+                    if issue.get("qa_doc_refs"):
+                        self.attach_qa_to_issue(issue)
+            self.refresh_filter_options()
+            self.refresh_issue_table()
+            self.update_summary()
+            generated_at = self.jira_cache_meta.get("generated_at", "unknown time")
+            self.status_var.set(f"Loaded Jira cache: {len(self.issues)} issues from {generated_at}. Use One Click Refresh Jira when you need current data.")
+        except Exception as exc:
+            self.status_var.set(f"Failed to load Jira cache: {exc}")
+
+    def load_jira_cache_clicked(self) -> None:
+        if not JIRA_CACHE_PATH.exists():
+            messagebox.showinfo("Load Jira Cache", f"No Jira cache exists yet.\n\nRefresh Jira once to create:\n{JIRA_CACHE_PATH}")
+            return
+        self.try_load_jira_cache_silent()
+        messagebox.showinfo(
+            "Load Jira Cache",
+            f"Loaded {len(self.issues)} cached Jira issues.\n\n"
+            f"Cache time: {self.jira_cache_meta.get('generated_at', '-')}\n"
+            f"Source: {self.jira_cache_meta.get('source', '-')}\n\n"
+            "Risk: cached status, assignee, links, and QA refs may be stale until you refresh Jira.",
+        )
+
+    def save_jira_cache_now(self, source: str) -> None:
+        try:
+            self.jira_cache_meta = save_jira_issue_cache(
+                self.issues,
+                jira_url=self.jira_url_var.get().strip() or DEFAULT_JIRA_URL,
+                jql=self.jql_var.get().strip(),
+                source=source,
+            )
+            self.update_summary()
+        except Exception as exc:
+            self.status_var.set(f"Jira cache save failed: {exc}")
+
+    def cached_issue_for_id(self, issue_id: str) -> dict[str, Any] | None:
+        for issue in self.issues:
+            if issue.get("id") == issue_id or issue.get("key") == issue_id:
+                return issue
+        return None
+
+    def apply_refreshed_jira_issue(self, issue: dict[str, Any]) -> str:
+        issue["id"] = issue.get("key") or f"ISSUE-{len(self.issues) + 1}"
+        existing = self.cached_issue_for_id(str(issue["id"]))
+        if existing and jira_issue_unchanged(existing, issue):
+            normalize_issue_match_state(existing)
+            return "unchanged"
+        match_input_changed = (
+            existing is not None
+            and issue_has_persisted_match(existing)
+            and jira_match_input_signature(existing) != jira_match_input_signature(issue)
+        )
+        result = "updated" if existing else "new"
+        self.add_or_replace_issue(issue, refresh=False)
+        stored = self.cached_issue_for_id(str(issue["id"]))
+        if stored and match_input_changed:
+            stored["match_status"] = MATCH_STATUS_NEEDS_REMATCH
+            old_reason = str(stored.get("reason") or "").strip()
+            note = "Jira matching inputs changed after the local match. Run Match All Issues when you want to refresh design evidence."
+            stored["reason"] = f"{old_reason}; {note}" if old_reason and note not in old_reason else note
+        return result
+
     def load_index_clicked(self) -> None:
         try:
             self.index = load_index()
+            ensure_design_index_lookup(self.index)
+            if QA_INDEX_PATH.exists():
+                self.qa_index = load_qa_index()
         except Exception as exc:
             messagebox.showerror("Load Index", str(exc))
             return
         self.update_summary()
-        messagebox.showinfo("Load Index", f"Loaded {len(self.index.get('requirements', []))} audio candidates.")
+        messagebox.showinfo(
+            "Load Index",
+            f"Loaded {len(self.index.get('requirements', []))} audio candidates and {len(self.qa_index.get('cases', []))} QA cases.",
+        )
+
+    def scan_qa_async(self) -> None:
+        root = Path(self.design_root_var.get().strip())
+        if not root.exists():
+            messagebox.showerror("Scan QA", f"Design root not found:\n{root}")
+            return
+        self.save_current_config()
+        self.status_var.set("Scanning QA acceptance docs...")
+        self.disable_buttons(True)
+        thread = threading.Thread(target=self._scan_qa_worker, args=(root,), daemon=True)
+        thread.start()
+
+    def _scan_qa_worker(self, root: Path) -> None:
+        try:
+            index = build_qa_acceptance_index(root, progress=lambda msg: self.after(0, self.status_var.set, msg))
+            save_qa_index(index)
+            self.qa_index = index
+            self.after(0, self.on_qa_scan_complete, None)
+        except Exception as exc:
+            self.after(0, self.on_qa_scan_complete, exc)
+
+    def on_qa_scan_complete(self, error: Exception | None) -> None:
+        self.disable_buttons(False)
+        if error:
+            self.status_var.set(f"QA scan failed: {error}")
+            messagebox.showerror("Scan QA", str(error))
+            return
+        if self.issues:
+            for issue in self.issues:
+                self.attach_qa_to_issue(issue)
+            self.refresh_issue_table()
+            selected = self.selected_issues()
+            if selected:
+                self.refresh_evidence_table(selected[0])
+            self.save_jira_cache_now("QA scan rematch")
+        self.update_summary()
+        summary = self.qa_index.get("summary", {})
+        self.status_var.set(f"QA scan complete. Docs: {summary.get('files_scanned', 0)} Cases: {summary.get('cases', 0)}")
+        messagebox.showinfo("Scan QA", json.dumps(summary, ensure_ascii=False, indent=2)[:4000])
 
     def show_quick_start(self) -> None:
         messagebox.showinfo(
@@ -2082,11 +4231,13 @@ class TriageGui(tk.Tk):
                 "1. The design index is already loaded when the top-right summary shows Index docs/chunks/requirements.",
                 "2. Click Open Dedicated Jira. Log into Jira once in that separate Edge window.",
                 "3. Click One Click Refresh Jira. The tool will reuse the dedicated Jira browser session.",
-                "4. Keep or edit the JQL, for example: assignee = yupeng AND statusCategory != Done ORDER BY updated DESC",
-                "5. Sync JQL uses the optional Cookie field. One Click Refresh Jira uses the dedicated browser first.",
-                "6. If browser sync is blocked by local policy, export CSV from Jira, then click Import Jira CSV.",
-                "7. Match All Issues only classifies issues that are already loaded.",
-                "8. If Jira auth is unavailable, paste one issue into Manual Jira text / notes, then click Paste Jira Text.",
+                "4. On startup the tool loads the last Jira cache automatically. Refresh only when you need current Jira status, links, or QA refs.",
+                "5. Keep or edit the JQL, for example: assignee = yupeng AND statusCategory != Done ORDER BY updated DESC",
+                "6. Sync JQL uses the optional Cookie field. One Click Refresh Jira uses the dedicated browser first.",
+                "7. If browser sync is blocked by local policy, export CSV from Jira, then click Import Jira CSV.",
+                "8. Match All Issues classifies the loaded issues and saves the matched cache automatically.",
+                "9. NotMatched means the row has not been matched yet. NoEvidence means matching ran but found no local design evidence.",
+                "10. If Jira auth is unavailable, paste one issue into Manual Jira text / notes, then click Paste Jira Text.",
             ]),
         )
 
@@ -2199,12 +4350,13 @@ class TriageGui(tk.Tk):
         start_at = 0
         fetched = 0
         total = None
+        refresh_counts = Counter()
         while fetched < limit:
             params = urllib.parse.urlencode({
                 "jql": jql,
                 "startAt": str(start_at),
                 "maxResults": str(min(page_size, limit - fetched)),
-                "fields": JIRA_SEARCH_FIELDS,
+                "fields": self.jira_fields_param(),
             })
             response = cdp_fetch_jira_url(base, jql, f"/rest/api/2/search?{params}", timeout=90)
             status = int(response.get("status") or 0)
@@ -2237,29 +4389,29 @@ class TriageGui(tk.Tk):
                 issue = parse_issue_from_json(raw)
                 issue["url"] = f"{base.rstrip()}/browse/{issue.get('key','')}"
                 issue["source"] = "Jira REST via dedicated browser"
-                self.add_or_replace_issue(issue, refresh=False)
+                self.enrich_issue_with_qa_design_refs(issue, fetch_details=False)
+                refresh_counts[self.apply_refreshed_jira_issue(issue)] += 1
             fetched += len(raw_issues)
             start_at += len(raw_issues)
-            self.status_var.set(f"Synced Jira from dedicated browser {fetched}/{total if total is not None else '?'}...")
+            self.status_var.set(
+                f"Synced Jira from dedicated browser {fetched}/{total if total is not None else '?'} "
+                f"(new {refresh_counts['new']}, updated {refresh_counts['updated']}, unchanged {refresh_counts['unchanged']})..."
+            )
             self.update_idletasks()
             if start_at >= total:
                 break
-        self.match_all_issues()
-        self.status_var.set(f"Synced and matched {fetched} Jira issues via dedicated browser. Total matched in table: {len(self.issues)}")
+        self.refresh_filter_options()
+        self.refresh_issue_table()
+        self.update_summary()
+        self.save_jira_cache_now("Jira REST via dedicated browser")
+        self.status_var.set(
+            f"Synced and cached {fetched} Jira issues via dedicated browser. "
+            f"New:{refresh_counts['new']} Updated:{refresh_counts['updated']} Unchanged:{refresh_counts['unchanged']}. "
+            "Click Match All Issues when you want design/audio classification."
+        )
         return True
 
     def one_click_refresh_jira_clicked(self) -> None:
-        if not self.index and INDEX_PATH.exists():
-            try:
-                self.index = load_index()
-                self.update_summary()
-            except Exception as exc:
-                messagebox.showerror("One Click Refresh Jira", f"Failed to load design index:\n{exc}")
-                return
-        if not self.index:
-            messagebox.showinfo("One Click Refresh Jira", "Load or scan the design index first.")
-            return
-
         decoded = self.normalize_jql_from_url_if_needed()
         if not self.jql_var.get().strip():
             messagebox.showinfo("One Click Refresh Jira", "JQL is empty. Paste a Jira issue navigator URL or enter JQL first.")
@@ -2285,13 +4437,18 @@ class TriageGui(tk.Tk):
     def scan_diff_async(self) -> None:
         self.start_design_scan(with_diff=True)
 
+    def cancel_scan_clicked(self) -> None:
+        self.scan_cancel_requested = True
+        self.status_var.set("Cancel requested. The scanner will stop after the current file.")
+
     def start_design_scan(self, with_diff: bool) -> None:
         root = Path(self.design_root_var.get().strip())
         if not root.exists():
             messagebox.showerror("Scan Design", f"Design root not found:\n{root}")
             return
         self.save_current_config()
-        self.status_var.set("Scanning design docs..." + (" Then comparing changes." if with_diff else ""))
+        self.scan_cancel_requested = False
+        self.status_var.set("Incremental scanning design docs..." + (" Then comparing changes." if with_diff else ""))
         mode = self.model_mode_var.get()
         try:
             diff_ai_limit = max(1, int(self.local_diff_limit_var.get().strip() or "20"))
@@ -2304,7 +4461,13 @@ class TriageGui(tk.Tk):
     def _scan_design_worker(self, root: Path, with_diff: bool, mode: str, diff_ai_limit: int) -> None:
         try:
             previous = load_index() if INDEX_PATH.exists() else {}
-            index = build_design_index(root, progress=lambda msg: self.after(0, self.status_var.set, msg))
+            index = build_design_index(
+                root,
+                progress=lambda msg: self.after(0, self.status_var.set, msg),
+                previous_index=previous,
+                should_cancel=lambda: self.scan_cancel_requested,
+            )
+            ensure_design_index_lookup(index)
             save_index(index)
             snapshot_path = save_snapshot(index)
             diff = {}
@@ -2331,6 +4494,7 @@ class TriageGui(tk.Tk):
             self.after(0, self.on_scan_complete, exc, with_diff, None, {})
 
     def on_scan_complete(self, error: Exception | None, with_diff: bool = False, snapshot_path: Path | None = None, report_paths: dict[str, str] | None = None) -> None:
+        self.scan_cancel_requested = False
         self.disable_buttons(False)
         if error:
             self.status_var.set(f"Scan failed: {error}")
@@ -2349,7 +4513,10 @@ class TriageGui(tk.Tk):
             }
             messagebox.showinfo("Scan + Diff Changes", json.dumps(msg, ensure_ascii=False, indent=2)[:4000])
         else:
-            self.status_var.set(f"Scan complete. Requirements: {summary.get('requirements', 0)} Chunks: {summary.get('chunks', 0)}")
+            self.status_var.set(
+                f"Scan complete. Parsed:{summary.get('parsed_docs', 0)} Reused:{summary.get('reused_docs', 0)} "
+                f"SkippedLarge:{summary.get('skipped_large_files', 0)} Requirements:{summary.get('requirements', 0)}"
+            )
             messagebox.showinfo("Scan Design", json.dumps(summary, ensure_ascii=False, indent=2)[:4000])
 
     def disable_buttons(self, disabled: bool) -> None:
@@ -2365,11 +4532,17 @@ class TriageGui(tk.Tk):
 
     def update_summary(self) -> None:
         summary = self.index.get("summary", {})
+        qa_summary = self.qa_index.get("summary", {})
         start_counts = Counter(issue.get("can_start", "Unknown") for issue in self.issues)
         start_bits = " ".join(f"{key}:{value}" for key, value in start_counts.items() if value)
+        matched_count = sum(1 for issue in self.issues if issue_has_persisted_match(issue))
+        unmatched_count = max(0, len(self.issues) - matched_count)
+        cache_time = str(self.jira_cache_meta.get("generated_at") or "").replace("T", " ")
+        cache_bits = f" cache:{cache_time[:16]}" if cache_time else " cache:none"
         self.summary_var.set(
             f"Index docs:{summary.get('files_scanned', 0)} chunks:{summary.get('chunks', 0)} "
-            f"requirements:{summary.get('requirements', 0)} issues:{len(self.issues)} {start_bits}"
+            f"requirements:{summary.get('requirements', 0)} QA:{qa_summary.get('cases', 0)} "
+            f"issues:{len(self.issues)} matched:{matched_count} unmatched:{unmatched_count}{cache_bits} {start_bits}"
         )
 
     def refresh_filter_options(self) -> None:
@@ -2601,7 +4774,7 @@ class TriageGui(tk.Tk):
             messagebox.showerror("Sync Issue", str(exc)[:4000])
             return
         self.add_or_replace_issue(issue)
-        self.match_all_issues()
+        self.match_all_issues(on_complete=lambda: self.save_jira_cache_now("Jira single issue"))
 
     def import_jira_csv_clicked(self) -> None:
         selected = filedialog.askopenfilename(
@@ -2633,13 +4806,20 @@ class TriageGui(tk.Tk):
             self.add_or_replace_issue(issue, refresh=False)
             count += 1
         if self.index:
-            self.match_all_issues()
+            def after_match() -> None:
+                self.save_jira_cache_now(f"Jira CSV: {path.name}")
+                self.status_var.set(f"Imported, matched, and cached {count} Jira issues from CSV: {path}")
+                messagebox.showinfo("Import Jira CSV", f"Imported, matched, and cached {count} Jira issues.\n\n{path}")
+
+            self.match_all_issues(on_complete=after_match)
+            return
         else:
             self.refresh_filter_options()
             self.refresh_issue_table()
             self.update_summary()
-        self.status_var.set(f"Imported {count} Jira issues from CSV: {path}")
-        messagebox.showinfo("Import Jira CSV", f"Imported {count} Jira issues.\n\n{path}")
+        self.save_jira_cache_now(f"Jira CSV: {path.name}")
+        self.status_var.set(f"Imported and cached {count} Jira issues from CSV: {path}")
+        messagebox.showinfo("Import Jira CSV", f"Imported and cached {count} Jira issues.\n\n{path}")
 
     def fetch_issue(self, key: str) -> dict[str, Any]:
         base = self.jira_url_var.get().strip()
@@ -2649,6 +4829,7 @@ class TriageGui(tk.Tk):
             data = json.loads(body)
             issue = parse_issue_from_json(data)
             issue["url"] = f"{base.rstrip()}/browse/{key}"
+            self.enrich_issue_with_qa_design_refs(issue)
             return issue
         status, ctype, body = jira_request(base, f"/browse/{urllib.parse.quote(key)}?filter=-1", cookie, timeout=20)
         issue = parse_issue_from_html(body, key)
@@ -2660,7 +4841,7 @@ class TriageGui(tk.Tk):
 
     def fetch_issue_via_dedicated_browser(self, key: str) -> dict[str, Any]:
         base = self.jira_url_var.get().strip() or DEFAULT_JIRA_URL
-        fields = urllib.parse.quote(JIRA_SEARCH_FIELDS, safe=",")
+        fields = urllib.parse.quote(self.jira_fields_param(), safe=",")
         response = cdp_fetch_jira_url(base, self.jql_var.get().strip(), f"/rest/api/2/issue/{urllib.parse.quote(key)}?fields={fields}", timeout=60)
         status = int(response.get("status") or 0)
         ctype = str(response.get("contentType") or "")
@@ -2669,6 +4850,7 @@ class TriageGui(tk.Tk):
             issue = parse_issue_from_json(json.loads(body))
             issue["url"] = f"{base.rstrip()}/browse/{key}"
             issue["source"] = "Jira REST via dedicated browser"
+            self.enrich_issue_with_qa_design_refs(issue)
             return issue
         if is_jira_login_page(body, str(response.get("title") or "")):
             self.open_dedicated_jira_browser(show_message=False)
@@ -2693,12 +4875,13 @@ class TriageGui(tk.Tk):
         start_at = 0
         fetched = 0
         total = None
+        refresh_counts = Counter()
         while fetched < limit:
             params = urllib.parse.urlencode({
                 "jql": jql,
                 "startAt": str(start_at),
                 "maxResults": str(min(page_size, limit - fetched)),
-                "fields": JIRA_SEARCH_FIELDS,
+                "fields": self.jira_fields_param(),
             })
             status, ctype, body = jira_request(base, f"/rest/api/2/search?{params}", cookie, timeout=60)
             if status != 200 or "json" not in ctype.lower():
@@ -2716,15 +4899,26 @@ class TriageGui(tk.Tk):
             for raw in raw_issues:
                 issue = parse_issue_from_json(raw)
                 issue["url"] = f"{base.rstrip()}/browse/{issue.get('key','')}"
-                self.add_or_replace_issue(issue, refresh=False)
+                self.enrich_issue_with_qa_design_refs(issue, fetch_details=False)
+                refresh_counts[self.apply_refreshed_jira_issue(issue)] += 1
             fetched += len(raw_issues)
             start_at += len(raw_issues)
-            self.status_var.set(f"Synced Jira {fetched}/{total if total is not None else '?'}...")
+            self.status_var.set(
+                f"Synced Jira {fetched}/{total if total is not None else '?'} "
+                f"(new {refresh_counts['new']}, updated {refresh_counts['updated']}, unchanged {refresh_counts['unchanged']})..."
+            )
             self.update_idletasks()
             if start_at >= total:
                 break
-        self.match_all_issues()
-        self.status_var.set(f"Synced and matched {fetched} Jira issues. Total matched in table: {len(self.issues)}")
+        self.refresh_filter_options()
+        self.refresh_issue_table()
+        self.update_summary()
+        self.save_jira_cache_now("Jira REST")
+        self.status_var.set(
+            f"Synced and cached {fetched} Jira issues. "
+            f"New:{refresh_counts['new']} Updated:{refresh_counts['updated']} Unchanged:{refresh_counts['unchanged']}. "
+            "Click Match All Issues when you want design/audio classification."
+        )
 
     def paste_jira_text(self) -> None:
         text = self.manual_text.get("1.0", tk.END).strip()
@@ -2735,26 +4929,50 @@ class TriageGui(tk.Tk):
         key = self.issue_key_var.get().strip().upper() or f"MANUAL-{len(self.issues) + 1}"
         issue = issue_from_manual_text(key, text)
         self.add_or_replace_issue(issue)
-        self.match_all_issues()
+        self.match_all_issues(on_complete=lambda: self.save_jira_cache_now("Manual Jira text"))
 
     def add_or_replace_issue(self, issue: dict[str, Any], refresh: bool = True) -> None:
         issue["id"] = issue.get("key") or f"ISSUE-{len(self.issues) + 1}"
+        existing_index = None
+        existing_issue = None
+        for idx, current in enumerate(self.issues):
+            if current.get("id") == issue["id"]:
+                existing_index = idx
+                existing_issue = current
+                break
+        incoming_has_match = issue_has_persisted_match(issue)
         issue["version_label"] = issue_version_label(issue)
         issue.setdefault("can_start", "Unknown")
         issue.setdefault("system", "")
-        issue.setdefault("design_area", "NoEvidence")
+        issue.setdefault("design_area", UNMATCHED_DESIGN_LABEL)
         issue.setdefault("design_doc", "")
         issue.setdefault("dependency_label", dependency_label(issue))
         issue.setdefault("audio_required", "Unknown")
         issue.setdefault("ready_state", "Unknown")
         issue.setdefault("sound_type", "")
         issue.setdefault("issue_links", "")
+        issue.setdefault("qa_doc_refs", [])
+        issue.setdefault("qa_design_issues", [])
+        issue.setdefault("qa_summary", "No QA")
+        issue.setdefault("qa_path", "")
+        issue.setdefault("qa_open_target", "")
+        issue.setdefault("qa_link_status", "Not checked")
         issue.setdefault("reporter", "")
         issue.setdefault("creator", "")
-        for idx, existing in enumerate(self.issues):
-            if existing.get("id") == issue["id"]:
-                self.issues[idx] = issue
-                break
+        issue.setdefault("match_status", MATCH_STATUS_NOT_MATCHED)
+        if existing_issue and issue_has_persisted_match(existing_issue) and not incoming_has_match:
+            for field in MATCH_RESULT_FIELDS:
+                if field in existing_issue:
+                    issue[field] = existing_issue[field]
+            issue["qa_doc_refs"] = dedupe_refs_prefer_full_paths(
+                list(existing_issue.get("qa_doc_refs") or []) + list(issue.get("qa_doc_refs") or [])
+            )
+            if existing_issue.get("qa_design_details") and not issue.get("qa_design_details"):
+                issue["qa_design_details"] = existing_issue.get("qa_design_details")
+            issue["dependency_label"] = dependency_label(issue)
+        normalize_issue_match_state(issue)
+        if existing_index is not None:
+            self.issues[existing_index] = issue
         else:
             self.issues.append(issue)
         if refresh:
@@ -2762,23 +4980,140 @@ class TriageGui(tk.Tk):
             self.refresh_issue_table()
             self.update_summary()
 
-    def match_all_issues(self) -> None:
+    def attach_qa_to_issue(self, issue: dict[str, Any]) -> None:
+        refs = [str(item) for item in issue.get("qa_doc_refs") or []]
+        design_root = Path(self.design_root_var.get().strip() or DEFAULT_DESIGN_ROOT)
+        if not self.qa_index:
+            issue["qa_cases"] = []
+            issue["qa_summary"] = "No QA"
+            issue["qa_path"] = summarize_qa_path_from_cases([], refs)
+            issue["qa_open_target"] = first_qa_open_target([], refs, design_root)
+            issue["qa_link_status"] = "QA index not loaded" if refs else "No QA ref"
+            for item in issue.get("evidence") or []:
+                item["qa_cases"] = []
+                item["qa_summary"] = "No QA"
+                item["qa_source"] = ""
+                item["qa_path"] = ""
+            return
+        evidence = issue.get("evidence") or []
+        inferred_docs: list[dict[str, Any]] = []
+        if not refs:
+            inferred_docs = qa_documents_matching_issue_topic(self.qa_index, issue, evidence, limit=2)
+            refs = dedupe_refs_prefer_full_paths(
+                str(doc.get("full_path") or doc.get("path") or "")
+                for doc in inferred_docs
+                if str(doc.get("full_path") or doc.get("path") or "").strip()
+            )
+            if refs:
+                issue["qa_doc_refs"] = refs
+        explicit_docs = qa_documents_matching_refs(self.qa_index, refs)
+        if not explicit_docs:
+            inferred_docs = inferred_docs or qa_documents_matching_issue_topic(self.qa_index, issue, evidence, limit=2)
+            inferred_refs = dedupe_refs_prefer_full_paths(
+                str(doc.get("full_path") or doc.get("path") or "")
+                for doc in inferred_docs
+                if str(doc.get("full_path") or doc.get("path") or "").strip()
+            )
+            if inferred_refs:
+                refs = dedupe_refs_prefer_full_paths(inferred_refs + refs)
+                issue["qa_doc_refs"] = refs
+                explicit_docs = inferred_docs
+        doc_fallback_refs: list[str] = []
+        for doc in explicit_docs:
+            for key in ("full_path", "path"):
+                value = str(doc.get(key) or "").strip()
+                if value:
+                    doc_fallback_refs.append(value)
+        fallback_refs = dedupe_keep_order(doc_fallback_refs + refs)
+        issue_cases = rank_qa_cases_for_issue(issue, self.qa_index, evidence, limit=80)
+        issue["qa_cases"] = issue_cases
+        issue["qa_summary"] = summarize_qa_cases(issue_cases)
+        issue["qa_path"] = summarize_qa_path_from_cases(issue_cases, fallback_refs)
+        issue["qa_open_target"] = first_qa_open_target(issue_cases, fallback_refs, design_root)
+        if inferred_docs and issue_cases:
+            issue["qa_link_status"] = "Inferred QA doc"
+        elif inferred_docs:
+            issue["qa_link_status"] = "Inferred QA path"
+        elif explicit_docs and issue_cases:
+            issue["qa_link_status"] = "Exact QA ref"
+        elif refs and not issue_cases:
+            issue["qa_link_status"] = "QA ref not indexed"
+        elif refs:
+            issue["qa_link_status"] = "QA ref weak"
+        elif issue_cases:
+            issue["qa_link_status"] = "Inferred QA"
+        else:
+            issue["qa_link_status"] = "No QA ref"
+        for item in evidence:
+            item_cases = issue_cases[:24]
+            item["qa_cases"] = item_cases
+            item["qa_summary"] = summarize_qa_cases(item_cases)
+            item["qa_source"] = ", ".join(sorted(set(case.get("qa_source", "") for case in item_cases if case.get("qa_source"))))[:80]
+            item["qa_path"] = summarize_qa_path_from_cases(item_cases, fallback_refs)
+
+    def match_one_issue(self, issue: dict[str, Any]) -> None:
+        evidence = rank_evidence(issue, self.index, limit=12)
+        verdict = classify_issue(issue, evidence)
+        issue["evidence"] = evidence
+        issue.update(verdict)
+        assign_issue_dimensions(issue)
+        self.attach_qa_to_issue(issue)
+        issue["match_status"] = MATCH_STATUS_MATCHED
+        issue["matched_at"] = now_stamp()
+
+    def match_all_issues(self, on_complete=None) -> None:
         if not self.index:
             messagebox.showinfo("Match", "Load or scan the design index first.")
             return
         if not self.issues:
             messagebox.showinfo("Match", "No Jira issues loaded yet. Click Sync JQL first, or paste an issue into Manual Jira text / notes and click Paste Jira Text.")
             return
-        for issue in self.issues:
-            evidence = rank_evidence(issue, self.index, limit=12)
-            verdict = classify_issue(issue, evidence)
-            issue["evidence"] = evidence
-            issue.update(verdict)
-            assign_issue_dimensions(issue)
+        if self.matching_issues:
+            messagebox.showinfo("Match", "Issue matching is already running.")
+            return
+        self.matching_issues = True
+        self.match_index = 0
+        self.match_after_complete = on_complete
+        self.disable_buttons(True)
+        self.status_var.set(f"Preparing fast design lookup for {len(self.issues)} Jira issues...")
+        self.after(10, self.match_all_issues_step)
+
+    def match_all_issues_step(self) -> None:
+        if not self.matching_issues:
+            return
+        try:
+            total = len(self.issues)
+            batch_start = time.perf_counter()
+            processed = 0
+            while self.match_index < total and processed < 4 and (time.perf_counter() - batch_start) < 0.09:
+                self.match_one_issue(self.issues[self.match_index])
+                self.match_index += 1
+                processed += 1
+            self.status_var.set(f"Matching Jira issues {self.match_index}/{total} against design index and QA cases...")
+            if self.match_index < total:
+                self.after(15, self.match_all_issues_step)
+                return
+        except Exception as exc:
+            self.matching_issues = False
+            self.match_after_complete = None
+            self.disable_buttons(False)
+            self.status_var.set(f"Match failed: {exc}")
+            messagebox.showerror("Match", str(exc)[:4000])
+            return
+
+        callback = self.match_after_complete
+        self.matching_issues = False
+        self.match_after_complete = None
+        self.disable_buttons(False)
         self.refresh_filter_options()
         self.refresh_issue_table()
         self.update_summary()
-        self.status_var.set(f"Matched {len(self.issues)} issues against design index.")
+        if callback:
+            callback()
+            self.status_var.set(f"Matched and cached {len(self.issues)} issues against design index and QA cases.")
+        else:
+            self.save_jira_cache_now("Local design/QA match")
+            self.status_var.set(f"Matched and cached {len(self.issues)} issues against design index and QA cases.")
 
     def refresh_issue_table(self) -> None:
         self.issue_tree.delete(*self.issue_tree.get_children())
@@ -2819,6 +5154,10 @@ class TriageGui(tk.Tk):
                     "components",
                     "labels",
                     "issue_links",
+                    "qa_summary",
+                    "qa_link_status",
+                    "qa_path",
+                    "qa_doc_refs",
                     "reason",
                 )
             ).lower()
@@ -2874,6 +5213,8 @@ class TriageGui(tk.Tk):
                     issue.get("version_label", ""),
                     issue.get("design_area", ""),
                     issue.get("dependency_label", ""),
+                    issue.get("qa_link_status", ""),
+                    issue.get("qa_path", ""),
                     issue.get("confidence", "-"),
                     issue.get("status", ""),
                     issue.get("summary", ""),
@@ -2892,6 +5233,22 @@ class TriageGui(tk.Tk):
         issue = selected[0]
         self.show_issue_detail(issue)
         self.refresh_evidence_table(issue)
+        self.update_selected_qa_path_label(issue)
+
+    def update_selected_qa_path_label(self, issue: dict[str, Any] | None = None) -> None:
+        if issue is None:
+            selected = self.selected_issues()
+            issue = selected[0] if selected else None
+        if not issue:
+            self.qa_path_var.set("QA Path: -")
+            return
+        item = self.current_evidence_item()
+        item_path = str(item.get("qa_path") or "").strip() if item else ""
+        label = item_path or str(issue.get("qa_path") or "").strip()
+        status = str(issue.get("qa_link_status") or "Not checked")
+        if not label:
+            label = "-"
+        self.qa_path_var.set(f"QA Path [{status}]: {label}"[:1200])
 
     def open_selected_jira_issue(self) -> None:
         selected = self.selected_issues()
@@ -2943,13 +5300,33 @@ class TriageGui(tk.Tk):
             f"Design Area: {issue.get('design_area','-')}  Design Doc: {issue.get('design_doc','-')}",
             f"System: {issue.get('system','-')}  Sound Type: {issue.get('sound_type','-')}  Can Start: {issue.get('can_start','-')}",
             f"Audio Required: {issue.get('audio_required','-')}  Ready: {issue.get('ready_state','-')}  Confidence: {issue.get('confidence','-')}",
+            f"QA: {issue.get('qa_summary','No QA')}",
+            f"QA Link Status: {issue.get('qa_link_status','Not checked')}",
+            f"QA Path: {issue.get('qa_path','') or '-'}",
             f"Reason: {issue.get('reason','-')}",
             "",
             "Top Evidence:",
         ]
+        qa_design_details = issue.get("qa_design_details") or []
+        if qa_design_details:
+            lines.extend(["", "Jira Test Case Design Issues:"])
+            for detail in qa_design_details[:8]:
+                refs = " | ".join(str(ref) for ref in (detail.get("refs") or [])[:3])
+                lines.append(
+                    f"- {detail.get('key','')} {detail.get('status','')} {detail.get('summary','')} "
+                    f"[{detail.get('fetch_status','')}] {refs}"
+                )
         for item in evidence[:5]:
             snippet = (item.get("evidence") or item.get("text") or "").replace("\n", " ")[:220]
             lines.append(f"- {item.get('doc_path','')} :: {item.get('locator','')} :: {snippet}")
+        qa_cases = issue.get("qa_cases") or []
+        if qa_cases:
+            lines.extend(["", "Top QA Cases:"])
+            for case in qa_cases[:5]:
+                lines.append(
+                    f"- {case.get('kind','')} {case.get('priority','')} {case.get('feature_point','')} :: {case.get('test_point','')} "
+                    f"({case.get('doc_path','')} {case.get('locator','')})"
+                )
         lines.extend(["", "Description:", str(issue.get("description", ""))[:3000]])
         self.detail_text.configure(state=tk.NORMAL)
         self.detail_text.delete("1.0", tk.END)
@@ -2960,6 +5337,7 @@ class TriageGui(tk.Tk):
         self.evidence_tree.delete(*self.evidence_tree.get_children())
         for idx, item in enumerate(issue.get("evidence") or []):
             iid = str(idx)
+            qa_cases = item.get("qa_cases") or []
             self.evidence_tree.insert(
                 "",
                 tk.END,
@@ -2969,6 +5347,9 @@ class TriageGui(tk.Tk):
                     item.get("audio_score", ""),
                     item.get("ready_state", ""),
                     item.get("sound_type", ""),
+                    summarize_qa_cases(qa_cases),
+                    summarize_qa_method(qa_cases),
+                    item.get("qa_source", ""),
                     item.get("doc_path", ""),
                     item.get("locator", ""),
                 ),
@@ -2995,6 +5376,123 @@ class TriageGui(tk.Tk):
         if full_path and Path(full_path).exists():
             os.startfile(str(Path(full_path)))
 
+    def selected_qa_cases(self) -> list[dict[str, Any]]:
+        item = self.current_evidence_item()
+        if item and item.get("qa_cases"):
+            return list(item.get("qa_cases") or [])
+        issues = self.selected_issues()
+        if issues:
+            return list(issues[0].get("qa_cases") or [])
+        return []
+
+    def format_qa_cases(self, cases: list[dict[str, Any]], limit: int = 80) -> str:
+        if not cases:
+            return "No QA cases matched the selected Jira/design evidence."
+        lines = [summarize_qa_cases(cases, compact=False), ""]
+        for index, case in enumerate(cases[:limit], 1):
+            lines.append(f"{index}. {case.get('kind','')} {case.get('priority','')} [{case.get('status','')}]")
+            lines.append(f"Feature: {case.get('feature_point','')}")
+            lines.append(f"Test Point: {case.get('test_point','')}")
+            steps = case.get("operation_steps") or []
+            if steps:
+                lines.append("Operation Steps:")
+                for step_index, step in enumerate(steps, 1):
+                    lines.append(f"  {step_index}. {step}")
+            if case.get("expected_result"):
+                lines.append(f"Expected Result: {case.get('expected_result','')}")
+            refs = case.get("design_refs") or []
+            if refs:
+                lines.append("Design Refs: " + " | ".join(str(ref) for ref in refs[:5]))
+            lines.append(f"Source: {case.get('doc_path','')} {case.get('locator','')} | Match: {case.get('qa_match_score','')} {case.get('qa_source','')}")
+            lines.append("")
+        if len(cases) > limit:
+            lines.append(f"... {len(cases) - limit} more cases omitted.")
+        return "\n".join(lines)
+
+    def show_selected_qa_cases(self) -> None:
+        cases = self.selected_qa_cases()
+        if not cases:
+            messagebox.showinfo("QA Cases", "No QA cases matched the selected row. Run Scan QA, then Match All Issues.")
+            return
+        win = tk.Toplevel(self)
+        win.title("QA Cases")
+        win.geometry("980x720")
+        win.configure(bg=BG)
+        text = tk.Text(win, bg="#101720", fg=INK, insertbackground=INK, relief=tk.FLAT, wrap=tk.WORD)
+        scroll = ttk.Scrollbar(win, orient=tk.VERTICAL, command=text.yview)
+        text.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=10)
+        scroll.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=10)
+        win.rowconfigure(0, weight=1)
+        win.columnconfigure(0, weight=1)
+        text.configure(yscrollcommand=scroll.set)
+        text.insert(tk.END, self.format_qa_cases(cases))
+        text.configure(state=tk.DISABLED)
+
+    def resolve_selected_issue_qa_refs(self, issue: dict[str, Any]) -> None:
+        if issue.get("_qa_details_resolved") or not issue.get("qa_design_issues"):
+            return
+        self.status_var.set("Resolving QA test-case-design link for selected Jira issue...")
+        self.update_idletasks()
+        self.enrich_issue_with_qa_design_refs(issue, fetch_details=True, max_details=3)
+        self.attach_qa_to_issue(issue)
+        self.update_selected_qa_path_label(issue)
+        self.show_issue_detail(issue)
+        self.refresh_evidence_table(issue)
+
+    def infer_selected_issue_qa_path(self, issue: dict[str, Any]) -> None:
+        if not self.qa_index:
+            return
+        self.status_var.set("Inferring QA path from matched design topic...")
+        self.update_idletasks()
+        self.attach_qa_to_issue(issue)
+        self.update_selected_qa_path_label(issue)
+        self.show_issue_detail(issue)
+        self.refresh_evidence_table(issue)
+        self.save_jira_cache_now("Inferred QA path")
+
+    def open_selected_qa_file(self) -> None:
+        selected = self.selected_issues()
+        issue = selected[0] if selected else None
+        cases = self.selected_qa_cases()
+        refs = list(issue.get("qa_doc_refs") or []) if issue else []
+        design_root = Path(self.design_root_var.get().strip() or DEFAULT_DESIGN_ROOT)
+        target = ""
+        if issue:
+            target = str(issue.get("qa_open_target") or "").strip()
+        if not target:
+            target = first_qa_open_target(cases, refs, design_root)
+        if not target and issue and issue.get("qa_design_issues") and not issue.get("_qa_details_resolved"):
+            try:
+                self.resolve_selected_issue_qa_refs(issue)
+                cases = self.selected_qa_cases()
+                refs = list(issue.get("qa_doc_refs") or [])
+                target = str(issue.get("qa_open_target") or "").strip() or first_qa_open_target(cases, refs, design_root)
+            except Exception as exc:
+                messagebox.showerror("Open QA Path", f"Could not resolve QA test-case-design issue:\n{exc}"[:4000])
+                return
+        if not target and issue and self.qa_index:
+            try:
+                self.infer_selected_issue_qa_path(issue)
+                cases = self.selected_qa_cases()
+                refs = list(issue.get("qa_doc_refs") or [])
+                target = str(issue.get("qa_open_target") or "").strip() or first_qa_open_target(cases, refs, design_root)
+            except Exception as exc:
+                messagebox.showerror("Open QA Path", f"Could not infer QA path:\n{exc}"[:4000])
+                return
+        if not target:
+            messagebox.showinfo("Open QA Path", "No QA path is available for the selected row. Run Scan QA and Sync Jira so the test case design issue can be read.")
+            return
+        try:
+            path = Path(target)
+            if path.exists():
+                os.startfile(str(path))
+                self.status_var.set(f"Opened QA file: {path}")
+            else:
+                os.startfile(target)
+                self.status_var.set(f"Opened QA path: {target}")
+        except Exception as exc:
+            messagebox.showerror("Open QA Path", f"Could not open QA path:\n{target}\n\n{exc}"[:4000])
+
     def copy_jira_reply(self) -> None:
         issues = self.selected_issues()
         if not issues:
@@ -3010,7 +5508,7 @@ class TriageGui(tk.Tk):
         lines = [
             f"Audio triage for {issue.get('key','')}: {issue.get('audio_required','Unknown')}",
             f"Can start: {issue.get('can_start','Unknown')} | Ready state: {issue.get('ready_state','Unknown')} | Confidence: {issue.get('confidence','Low')}",
-            f"System: {issue.get('system','Unknown')} | Design area: {issue.get('design_area','NoEvidence')} | Version: {issue.get('version_label','Unspecified')}",
+            f"System: {issue.get('system','Unknown')} | Design area: {issue.get('design_area',UNMATCHED_DESIGN_LABEL)} | Version: {issue.get('version_label','Unspecified')}",
             f"Reason: {issue.get('reason','')}",
         ]
         if evidence:
@@ -3051,6 +5549,10 @@ class TriageGui(tk.Tk):
             "issue_links",
             "issue_type",
             "priority",
+            "qa_summary",
+            "qa_link_status",
+            "qa_path",
+            "qa_doc_refs",
             "reason",
             "best_doc",
             "best_locator",
@@ -3084,6 +5586,10 @@ class TriageGui(tk.Tk):
                     "issue_links": issue.get("issue_links", ""),
                     "issue_type": issue.get("issue_type", ""),
                     "priority": issue.get("priority", ""),
+                    "qa_summary": issue.get("qa_summary", ""),
+                    "qa_link_status": issue.get("qa_link_status", ""),
+                    "qa_path": issue.get("qa_path", ""),
+                    "qa_doc_refs": "; ".join(str(ref) for ref in issue.get("qa_doc_refs") or []),
                     "reason": issue.get("reason", ""),
                     "best_doc": best.get("doc_path", ""),
                     "best_locator": best.get("locator", ""),
@@ -3097,8 +5603,8 @@ class TriageGui(tk.Tk):
             f"- Index: `{INDEX_PATH}`",
             f"- Issues: {len(self.issues)}",
             "",
-            "| Jira | Audio? | Start? | Ready | System | Version | Design | Dependency | Confidence | Summary | Best Evidence |",
-            "|---|---|---|---|---|---|---|---|---|---|---|",
+            "| Jira | Audio? | Start? | Ready | System | Version | Design | Dependency | QA Link | QA Path | Confidence | Summary | Best Evidence |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for issue in self.issues:
             evidence = issue.get("evidence") or []
@@ -3117,6 +5623,8 @@ class TriageGui(tk.Tk):
                         issue.get("version_label", ""),
                         issue.get("design_area", ""),
                         issue.get("dependency_label", ""),
+                        issue.get("qa_link_status", ""),
+                        issue.get("qa_path", ""),
                         issue.get("confidence", ""),
                         issue.get("summary", ""),
                         best_label,
@@ -3134,10 +5642,13 @@ class TriageGui(tk.Tk):
             lines.append(f"- Dependency: {issue.get('dependency_label','')} | Links: {issue.get('issue_links','')}")
             lines.append(f"- Jira Status: {issue.get('status','')} | Assignee: {issue.get('assignee','')} | Reporter: {issue.get('reporter','')} | Creator: {issue.get('creator','')}")
             lines.append(f"- Component: {issue.get('components','')} | Labels: {issue.get('labels','')}")
+            lines.append(f"- QA: {issue.get('qa_summary','No QA')} | {issue.get('qa_link_status','')} | `{issue.get('qa_path','')}`")
             lines.append(f"- Reason: {issue.get('reason','')}")
             for item in (issue.get("evidence") or [])[:5]:
                 snippet = (item.get("evidence") or item.get("text") or "").replace("\n", " ")[:300]
-                lines.append(f"- Evidence: `{item.get('doc_path','')}` {item.get('locator','')} - {snippet}")
+                lines.append(f"- Evidence: `{item.get('doc_path','')}` {item.get('locator','')} - QA {summarize_qa_cases(item.get('qa_cases') or [])} - {snippet}")
+            for case in (issue.get("qa_cases") or [])[:5]:
+                lines.append(f"- QA Case: `{case.get('doc_path','')}` {case.get('locator','')} - {case.get('feature_point','')} / {case.get('test_point','')}")
             lines.append("")
         md_path.write_text("\n".join(lines), encoding="utf-8")
         self.status_var.set(f"Exported: {md_path}")
@@ -3247,6 +5758,18 @@ def self_test() -> int:
     return 0
 
 
+def self_test_qa() -> int:
+    root = DEFAULT_DESIGN_ROOT
+    if not root.exists():
+        print(json.dumps({"root": str(root), "exists": False}, ensure_ascii=False, indent=2))
+        return 1
+    index = build_qa_acceptance_index(root)
+    save_qa_index(index)
+    sample = index.get("cases", [])[:5]
+    print(json.dumps({"summary": index.get("summary", {}), "sample_cases": sample}, ensure_ascii=False, indent=2))
+    return 0
+
+
 def arg_value(name: str, default: str = "") -> str:
     if name not in sys.argv:
         return default
@@ -3264,7 +5787,8 @@ def scan_diff_once_cli() -> int:
         return 1
 
     previous = load_index()
-    index = build_design_index(root)
+    index = build_design_index(root, previous_index=previous)
+    ensure_design_index_lookup(index)
     save_index(index)
     snapshot_path = save_snapshot(index)
 
@@ -3301,9 +5825,33 @@ def scan_diff_once_cli() -> int:
     return 0
 
 
+def scan_qa_once_cli() -> int:
+    design_root_text = arg_value("--design-root", str(DEFAULT_DESIGN_ROOT))
+    root = Path(design_root_text)
+    if not root.exists():
+        print(json.dumps({"ok": False, "error": f"Design root not found: {root}"}, ensure_ascii=False, indent=2))
+        return 1
+    index = build_qa_acceptance_index(root)
+    save_qa_index(index)
+    output = {
+        "ok": True,
+        "qa_index": str(QA_INDEX_PATH),
+        "summary": index.get("summary", {}),
+        "generated_roots": index.get("generated_roots", []),
+        "testcase_roots": index.get("testcase_roots", []),
+        "scan_roots": index.get("scan_roots", []),
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main() -> int:
     if "--self-test" in sys.argv:
         return self_test()
+    if "--self-test-qa" in sys.argv:
+        return self_test_qa()
+    if "--scan-qa-once" in sys.argv:
+        return scan_qa_once_cli()
     if "--scan-diff-once" in sys.argv:
         return scan_diff_once_cli()
     app = TriageGui()

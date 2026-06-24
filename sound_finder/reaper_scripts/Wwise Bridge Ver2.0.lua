@@ -13,6 +13,13 @@ local r = reaper
 local SCRIPT_TITLE = "Wwise Bridge - Region Container Exporter"
 local EXT_SECTION = "Codex_WwiseRegionBridge"
 local ACTION_RENDER_RECENT = 42230 -- File: Render project, using the most recent render settings, auto-close render dialog
+-- REAPER RENDER_FORMAT blob for WAV 24-bit ("evaw" + 0x18). Action 42230 renders with
+-- whatever output FORMAT the project currently has; the script sets source/bounds/path
+-- but used to leave the format alone, so if the user last rendered video the bridge wrote
+-- .mp4 files and then could not find the .wav it expected ("Render missing" + empty import
+-- array). We force this WAV cfg per render and restore the user's format afterward. This
+-- exact value is what the user's own projects already use as their WAV render cfg.
+local WAV_RENDER_CFG = "ZXZhdxgAAQ=="
 
 local settings = {
   render_path = "",
@@ -23,12 +30,13 @@ local settings = {
   import_operation_idx = 0, -- useExisting
   wwise_root_path = "\\Actor-Mixer Hierarchy\\Default Work Unit",
   auto_save_wwise = false,
+  force_render_settings = true, -- true: tool forces Master mix + WAV; false: use REAPER's own render source/format
 }
 
 local import_operations = { "useExisting", "replaceExisting", "createNew" }
 local output_mode_combo = "Export local files only\0Export local files + import to Wwise\0Import existing local files to Wwise\0"
 local import_operation_combo = "useExisting\0replaceExisting\0createNew\0"
-local container_type_combo = "Random Container\0Switch Container\0"
+local container_type_combo = "Random Container\0Switch Container\0Sound SFX (no container)\0"
 local scan_filter = ""
 local wwise_filter = ""
 local region_count_total = 0
@@ -73,6 +81,7 @@ local function LoadSettings()
   settings.render_regions = LoadSetting("render_regions", "1") ~= "0"
   settings.import_to_wwise = LoadSetting("import_to_wwise", "1") ~= "0"
   settings.auto_save_wwise = LoadSetting("auto_save_wwise", "0") == "1"
+  settings.force_render_settings = LoadSetting("force_render_settings", "1") ~= "0"
   settings.import_operation_idx = tonumber(LoadSetting("import_operation_idx", "0")) or 0
 end
 
@@ -84,6 +93,7 @@ local function SaveSettings()
   SaveSetting("render_regions", settings.render_regions and "1" or "0")
   SaveSetting("import_to_wwise", settings.import_to_wwise and "1" or "0")
   SaveSetting("auto_save_wwise", settings.auto_save_wwise and "1" or "0")
+  SaveSetting("force_render_settings", settings.force_render_settings and "1" or "0")
   SaveSetting("import_operation_idx", tostring(settings.import_operation_idx))
 end
 
@@ -132,6 +142,27 @@ local function FileExists(path)
   return false
 end
 
+-- When the tool is NOT forcing WAV, REAPER may render any extension (whatever its render
+-- format is). The filename base is still our RENDER_PATTERN (child_name), so locate the
+-- produced file by exact base name regardless of extension. Prefers .wav if several exist.
+local function FindRenderedFile(dir, base)
+  local wav = PathJoin(dir, base .. ".wav")
+  if FileExists(wav) then return wav end
+  local best = nil
+  local i = 0
+  while true do
+    local fn = r.EnumerateFiles(dir, i)
+    if not fn then break end
+    local b, ext = fn:match("^(.*)%.([^%.]+)$")
+    if b and b:lower() == base:lower() then
+      best = PathJoin(dir, fn)
+      if ext and ext:lower() == "wav" then return best end
+    end
+    i = i + 1
+  end
+  return best
+end
+
 local function SanitizeName(name)
   local n = tostring(name or "")
   n = n:gsub("[\\/:*?\"<>|]", "_")
@@ -174,6 +205,12 @@ local function SelectedRegionsForGroup(group)
 end
 
 local function ChildNameForSelectedIndex(group, selected_index)
+  -- A single-file Sound SFX import keeps the plain region name (no _NN suffix), since
+  -- there is nothing to order. The _NN suffix is still used for containers and for any
+  -- multi-region group so same-named regions stay ordered.
+  if group.container_type_idx == 2 and #SelectedRegionsForGroup(group) <= 1 then
+    return group.safe_name
+  end
   return string.format("%s_%02d", group.safe_name, selected_index)
 end
 
@@ -389,6 +426,7 @@ local function RebuildGroups(preserve)
       group = {
         raw_name = region.raw_name,
         safe_name = name,
+        is_new = preserve[name] == nil,
         region_indices = {},
         container_type_idx = old.container_type_idx or 0,
         switch_group_id = old.switch_group_id or "",
@@ -410,6 +448,11 @@ local function RebuildGroups(preserve)
   table.sort(groups, function(a, b) return Lower(a.safe_name) < Lower(b.safe_name) end)
   for _, group in ipairs(groups) do
     table.sort(group.region_indices, function(a, b) return regions[a].pos < regions[b].pos end)
+    -- A brand-new group that is a single audio file defaults to a plain Sound SFX import
+    -- (idx 2) instead of a Random Container. Any user-chosen type is preserved (not is_new).
+    if group.is_new and #group.region_indices == 1 and group.container_type_idx == 0 then
+      group.container_type_idx = 2
+    end
     EnsureSwitchAssignments(group)
   end
 end
@@ -1155,24 +1198,35 @@ end
 
 local function RenderOneRegion(region, child_name)
   local proj = Project()
-  local ext = settings.render_ext:gsub("^%.", "")
-  local expected_file = PathJoin(settings.render_path, child_name .. "." .. ext)
 
   r.GetSet_LoopTimeRange(true, false, region.pos, region.rgnend, false)
-  -- Force render source = Master mix and bounds = Time selection. Without this the
-  -- script inherits "most recent render settings"; if that source was Stems/selected
-  -- items/region matrix, the master is silent over the time selection and we get a
-  -- full-length SILENT wav that still passes FileExists (the empty-shell bug).
-  r.GetSetProjectInfo(proj, "RENDER_SETTINGS", 0, true)
+  -- Bounds = Time selection is always forced: it is how the tool isolates one region per
+  -- render (the time selection above is set to this region). This is the export mechanism,
+  -- not a "render setting" the user picks, so it is not gated by force_render_settings.
   r.GetSetProjectInfo(proj, "RENDER_BOUNDSFLAG", 2, true)
+  if settings.force_render_settings then
+    -- Tool owns the render: force source = Master mix and format = WAV. Without Master mix
+    -- a Stems/selected-items source can be silent over the time selection (empty-shell bug);
+    -- without WAV the project's current format (e.g. video/MP4) would write a non-.wav file
+    -- the import never finds. Snapshot/RestoreRenderState restores the user's values after.
+    r.GetSetProjectInfo(proj, "RENDER_SETTINGS", 0, true)
+    r.GetSetProjectInfo_String(proj, "RENDER_FORMAT", WAV_RENDER_CFG, true)
+  end
   r.GetSetProjectInfo_String(proj, "RENDER_FILE", ToReaperPath(settings.render_path), true)
   r.GetSetProjectInfo_String(proj, "RENDER_PATTERN", child_name, true)
   r.Main_OnCommand(ACTION_RENDER_RECENT, 0)
 
-  if FileExists(expected_file) then
-    return true, expected_file
+  if settings.force_render_settings then
+    -- Output is guaranteed .wav.
+    local expected_file = PathJoin(settings.render_path, child_name .. ".wav")
+    if FileExists(expected_file) then return true, expected_file end
+    return false, expected_file
   end
-  return false, expected_file
+
+  -- Using REAPER's own format: extension is whatever REAPER produced; detect by base name.
+  local found = FindRenderedFile(settings.render_path, child_name)
+  if found then return true, found end
+  return false, PathJoin(settings.render_path, child_name .. ".wav")
 end
 
 local function SnapshotRenderState()
@@ -1182,6 +1236,7 @@ local function SnapshotRenderState()
   local _, render_pattern = r.GetSetProjectInfo_String(proj, "RENDER_PATTERN", "", false)
   local bounds = r.GetSetProjectInfo(proj, "RENDER_BOUNDSFLAG", 0, false)
   local render_settings = r.GetSetProjectInfo(proj, "RENDER_SETTINGS", 0, false)
+  local _, render_format = r.GetSetProjectInfo_String(proj, "RENDER_FORMAT", "", false)
   return {
     loop_start = loop_start,
     loop_end = loop_end,
@@ -1189,6 +1244,7 @@ local function SnapshotRenderState()
     render_pattern = render_pattern,
     bounds = bounds,
     render_settings = render_settings,
+    render_format = render_format,
   }
 end
 
@@ -1200,6 +1256,9 @@ local function RestoreRenderState(state)
   r.GetSetProjectInfo_String(proj, "RENDER_PATTERN", state.render_pattern or "", true)
   if state.bounds then r.GetSetProjectInfo(proj, "RENDER_BOUNDSFLAG", state.bounds, true) end
   if state.render_settings ~= nil then r.GetSetProjectInfo(proj, "RENDER_SETTINGS", state.render_settings, true) end
+  if state.render_format and state.render_format ~= "" then
+    r.GetSetProjectInfo_String(proj, "RENDER_FORMAT", state.render_format, true)
+  end
 end
 
 -- RENDER_BOUNDSFLAG values: 0=custom time, 1=entire project, 2=time selection,
@@ -1212,6 +1271,9 @@ local RENDER_BOUNDS_SELECTED_REGIONS = 5
 -- This does NOT change the script's own per-region export (which keeps the RegionName_NN
 -- naming for Wwise import); it only sets the native render defaults the user sees.
 local function ApplyPreferredRenderDefaults()
+  -- Respect the user's choice: when not forcing tool render settings, leave REAPER's own
+  -- render dialog (source/bounds/format/pattern) completely untouched.
+  if not settings.force_render_settings then return end
   local proj = Project()
   r.GetSetProjectInfo(proj, "RENDER_SETTINGS", 0, true)
   r.GetSetProjectInfo(proj, "RENDER_BOUNDSFLAG", RENDER_BOUNDS_SELECTED_REGIONS, true)
@@ -1294,7 +1356,16 @@ local function ExecuteProcess()
 
       local switch_group = SwitchGroupById(group.switch_group_id)
       local switch_value = SwitchValueById(switch_group, group.switch_value_id)
-      local container_path = group.container_type_idx == 1 and ParentContainerPath(group) or (settings.wwise_root_path .. "\\" .. group.safe_name)
+      local is_sfx = group.container_type_idx == 2
+      local container_path
+      if group.container_type_idx == 1 then
+        container_path = ParentContainerPath(group)
+      elseif is_sfx then
+        -- Sound SFX: no wrapping container; sounds land directly under the target node.
+        container_path = settings.wwise_root_path
+      else
+        container_path = settings.wwise_root_path .. "\\" .. group.safe_name
+      end
       local import_container_path = group.container_type_idx == 1 and ValueBucketPath(group, switch_group, switch_value) or container_path
       local import_items = {}
 
@@ -1347,6 +1418,10 @@ local function ExecuteProcess()
             Log("Skipped Wwise import because file is missing: " .. item.audioFile)
           end
         end
+        if #import_items == 0 then
+          can_import = false
+          Log("Skipped Wwise import because no audio files were produced for: " .. group.safe_name)
+        end
 
         if can_import then
           local container_ready = false
@@ -1367,6 +1442,9 @@ local function ExecuteProcess()
                 Log("Skipped Wwise import because Switch/State Group reference failed: " .. group.safe_name)
               end
             end
+          elseif is_sfx then
+            -- No container to create; the import places Sound SFX objects directly.
+            container_ready = true
           elseif CreateContainer(settings.wwise_root_path, group) then
             container_ready = true
           end
@@ -1518,6 +1596,16 @@ local function DrawRenderPanel()
     if not settings.import_to_wwise then r.ImGui_BeginDisabled(ctx) end
     changed, settings.auto_save_wwise = r.ImGui_Checkbox(ctx, "Save Wwise project after import", settings.auto_save_wwise)
     if not settings.import_to_wwise then r.ImGui_EndDisabled(ctx) end
+
+    changed, settings.force_render_settings = r.ImGui_Checkbox(ctx, "Force tool render settings (Master mix + WAV)", settings.force_render_settings)
+    if r.ImGui_IsItemHovered(ctx) then
+      r.ImGui_SetTooltip(ctx, "Checked: the tool forces render source = Master mix and format = WAV for every region, then restores your REAPER render settings afterward (recommended for Wwise import).\nUnchecked: the tool uses REAPER's own render source and format; only the per-region time selection, output folder and file name are managed by the tool.")
+    end
+    if settings.force_render_settings then
+      r.ImGui_TextDisabled(ctx, "Render source/format: tool (Master mix + WAV).")
+    else
+      r.ImGui_TextColored(ctx, 0xFFD166FF, "Render source/format: REAPER's own - set REAPER's render Format to WAV (or an audio format Wwise accepts).")
+    end
 
     r.ImGui_Text(ctx, "Render folder")
     r.ImGui_SetNextItemWidth(ctx, -1)
@@ -1827,6 +1915,8 @@ local function DrawGroupPanel()
         local switch_value = SwitchValueById(switch_group, group.switch_value_id)
         if group.container_type_idx == 1 then
           r.ImGui_Text(ctx, ValueBucketPath(group, switch_group, switch_value))
+        elseif group.container_type_idx == 2 then
+          r.ImGui_Text(ctx, settings.wwise_root_path .. "\\<Sound SFX> (no container)")
         else
           r.ImGui_Text(ctx, settings.wwise_root_path .. "\\" .. group.safe_name)
         end

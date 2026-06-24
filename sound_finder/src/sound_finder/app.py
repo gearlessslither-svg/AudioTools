@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 import sys
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,13 +46,21 @@ from PySide6.QtWidgets import (
 
 from .audio_meta import analyze_audio, format_audio_analysis, format_duration
 from .db import PlanCategory, SoundFinderDB
-from .handoff import CURRENT_PLAN_PATH, read_plan_file, write_plan_file
+from .handoff import (
+    CODEX_REQUEST_DIR,
+    CURRENT_PLAN_PATH,
+    HANDOFF_DIR,
+    read_plan_file,
+    write_codex_request_file,
+    write_plan_file,
+)
 from .indexer import score_file, search_audio_files, scan_library
 from .local_llm import (
     DEFAULT_OLLAMA_URL,
     DEFAULT_OPENAI_URL,
     DEFAULT_REMOTE_MODEL,
     DEFAULT_REMOTE_URL,
+    DEFAULT_TIMEOUT,
     LocalModelConfig,
     config_from_mapping,
     generate_requirement_plan,
@@ -66,7 +77,7 @@ from .recipe import (
 )
 from .reaper_tracks import create_or_update_reaper_project, reaper_exe_path
 from .soundly_export import export_soundly_search_sheet
-from .widgets import DragFileLabel, ResultTable, WaveformView
+from .widgets import DragDocumentLabel, DragFileLabel, ResultTable, WaveformView
 
 
 class ScanWorker(QObject):
@@ -87,6 +98,191 @@ class ScanWorker(QObject):
             self.finished.emit(stats)
         except Exception as exc:  # pragma: no cover - UI worker boundary
             self.failed.emit(str(exc))
+
+
+class ClaudeRequestWorker(QObject):
+    """Runs Claude Code headless to turn a handoff request card into current_plan.json.
+
+    Mirrors the manual Codex drag-and-drop handoff: Claude reads the request `.md`
+    and writes the plan JSON to ``current_plan_path``. The GUI's existing
+    ``codex_handoff_timer`` then reverse-fills the plan and auto-searches.
+    """
+
+    progress = Signal(str)
+    finished = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, request_path: Path, plan_path: Path, cwd: Path, timeout: int = 600) -> None:
+        super().__init__()
+        self.request_path = request_path
+        self.plan_path = plan_path
+        self.cwd = cwd
+        self.timeout = timeout
+
+    def run(self) -> None:
+        try:
+            exe = shutil.which("claude")
+            if not exe:
+                self.failed.emit(
+                    "找不到 claude CLI。请确认已安装 Claude Code 并在 PATH 中（npm i -g @anthropic-ai/claude-code）。"
+                )
+                return
+
+            prompt = (
+                "You are completing a Sound Finder handoff. "
+                f'Read the request file at "{self.request_path}" and follow its instructions exactly: '
+                "analyze the sound requirement and WRITE the plan JSON to "
+                f'"{self.plan_path}" using the schema in the request. '
+                "Write only that JSON file — do not print the plan to stdout, do not ask questions, "
+                "and do not run any other commands."
+            )
+
+            args = [exe, "-p", "--permission-mode", "acceptEdits"]
+            if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
+                # CreateProcess cannot launch .cmd/.bat directly; route through cmd.exe.
+                args = ["cmd", "/c", *args]
+
+            self.progress.emit("Claude 正在后台处理需求卡...")
+            proc = subprocess.run(
+                args,
+                input=prompt,
+                cwd=str(self.cwd),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()[-1200:]
+                self.failed.emit(f"Claude 退出码 {proc.returncode}。\n{detail}")
+                return
+            if not self.plan_path.exists():
+                detail = (proc.stdout or "").strip()[-1200:]
+                self.failed.emit(f"Claude 已结束但没有写出方案文件。\n{detail}")
+                return
+            self.finished.emit({"stdout": (proc.stdout or "").strip()[-1200:]})
+        except subprocess.TimeoutExpired:
+            self.failed.emit(f"Claude 处理超时（>{self.timeout}s）。")
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class CodexRequestWorker(QObject):
+    """Runs Codex CLI headless to turn a handoff request card into current_plan.json."""
+
+    progress = Signal(str)
+    finished = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, request_path: Path, plan_path: Path, cwd: Path, timeout: int = 900) -> None:
+        super().__init__()
+        self.request_path = request_path
+        self.plan_path = plan_path
+        self.cwd = cwd
+        self.timeout = timeout
+        try:
+            self.baseline_mtime = plan_path.stat().st_mtime
+        except OSError:
+            self.baseline_mtime = 0.0
+
+    def run(self) -> None:
+        try:
+            exe = self.find_codex_executable()
+            if not exe:
+                self.failed.emit(
+                    "找不到可后台调用的 Codex CLI。已保留请求卡，可以手动拖给 Codex。\n"
+                    r"建议路径：C:\Users\user1\AppData\Local\OpenAI\Codex\bin\codex.exe"
+                )
+                return
+
+            prompt = (
+                "You are completing a Sound Finder handoff. "
+                f'Read the request file at "{self.request_path}" and follow its instructions exactly: '
+                "analyze the sound requirement and WRITE the plan JSON to "
+                f'"{self.plan_path}" using the schema in the request. '
+                "Write only that JSON file. Do not ask questions. Do not modify any other files."
+            )
+
+            args = [
+                str(exe),
+                "exec",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "workspace-write",
+                "--color",
+                "never",
+                prompt,
+            ]
+
+            self.progress.emit("Codex 正在后台处理需求卡...")
+            proc = subprocess.run(
+                args,
+                cwd=str(self.cwd),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()[-1600:]
+                self.failed.emit(f"Codex 退出码 {proc.returncode}。\n{detail}")
+                return
+            try:
+                current_mtime = self.plan_path.stat().st_mtime
+            except OSError:
+                detail = (proc.stdout or "").strip()[-1600:]
+                self.failed.emit(f"Codex 已结束但没有写出方案文件。\n{detail}")
+                return
+            if current_mtime <= self.baseline_mtime:
+                detail = (proc.stdout or proc.stderr or "").strip()[-1600:]
+                self.failed.emit(f"Codex 已结束但没有更新方案文件。\n{detail}")
+                return
+            self.finished.emit({"stdout": (proc.stdout or "").strip()[-1600:]})
+        except subprocess.TimeoutExpired:
+            self.failed.emit(f"Codex 处理超时（>{self.timeout}s）。请求卡已保留，可手动拖给 Codex。")
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+    @staticmethod
+    def find_codex_executable() -> Path | None:
+        candidates: list[Path] = []
+        env_cmd = os.environ.get("SOUND_FINDER_CODEX_CMD", "").strip()
+        if env_cmd:
+            candidates.append(Path(env_cmd))
+
+        local_bin = Path(os.environ.get("LOCALAPPDATA", "")) / "OpenAI" / "Codex" / "bin"
+        if local_bin.exists():
+            versioned = sorted(
+                [
+                    path / "codex.exe"
+                    for path in local_bin.iterdir()
+                    if path.is_dir() and (path / "codex.exe").exists()
+                ],
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            candidates.extend(versioned)
+            candidates.append(local_bin / "codex.exe")
+
+        which = shutil.which("codex")
+        if which and "WindowsApps" not in which:
+            candidates.append(Path(which))
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.expanduser().resolve()
+            except OSError:
+                continue
+            key = str(resolved).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if resolved.exists() and resolved.is_file():
+                return resolved
+        return None
 
 
 class AudioTaskWorker(QObject):
@@ -559,7 +755,7 @@ class LocalRequirementDialog(QDialog):
             remote_api_key=self.remote_api_key_edit.text().strip(),
             remote_slow_ms=max(1, self.int_value(self.remote_slow_ms_edit.text(), 6000)),
             temperature=self.float_value(self.temperature_edit.text(), 0.2),
-            timeout=self.int_value(self.timeout_edit.text(), 90),
+            timeout=self.int_value(self.timeout_edit.text(), DEFAULT_TIMEOUT),
             max_categories=max(1, self.int_value(self.max_categories_edit.text(), 10)),
             allow_rule_fallback=self.fallback_check.isChecked(),
         )
@@ -610,6 +806,11 @@ class MainWindow(QMainWindow):
         self.audio_analysis_cache: dict[str, dict[str, Any]] = {}
         self.pending_seek_position_ms: int | None = None
         self.pending_seek_path = ""
+        self.codex_request_path: Path | None = None
+        self.codex_plan_baseline_mtime = 0.0
+        self.codex_handoff_timer = QTimer(self)
+        self.codex_handoff_timer.setInterval(2000)
+        self.codex_handoff_timer.timeout.connect(self.check_codex_handoff_result)
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -676,6 +877,11 @@ class MainWindow(QMainWindow):
         self.task_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.toggle_plan_button = QPushButton("展开需求/方案")
         self.local_model_button = QPushButton("模型拆解/搜索")
+        self.codex_request_button = QPushButton("生成 Codex 请求卡")
+        self.codex_cli_request_button = QPushButton("用 Codex 处理")
+        self.codex_cli_request_button.setToolTip("生成请求卡并让本机 Codex CLI 后台写回方案，自动反向填充并搜索")
+        self.claude_request_button = QPushButton("用 Claude 处理")
+        self.claude_request_button.setToolTip("生成请求卡并让本机 Claude Code 后台写回方案，自动反向填充并搜索")
         import_button = QPushButton("导入 Codex 方案")
         result_limit_label = QLabel("每栏条数")
         self.result_limit_spin = QSpinBox()
@@ -714,6 +920,9 @@ class MainWindow(QMainWindow):
         for widget in (
             self.toggle_plan_button,
             self.local_model_button,
+            self.codex_request_button,
+            self.codex_cli_request_button,
+            self.claude_request_button,
             import_button,
             result_limit_label,
             self.result_limit_spin,
@@ -730,10 +939,16 @@ class MainWindow(QMainWindow):
             button_row.addWidget(widget)
         button_row.addStretch(1)
         summary_outer.addLayout(button_row)
+        self.codex_request_card = DragDocumentLabel("尚未创建 Codex 请求卡")
+        self.codex_request_card.setVisible(False)
+        summary_outer.addWidget(self.codex_request_card)
         root.addWidget(summary_group)
 
         self.toggle_plan_button.clicked.connect(self.toggle_plan_detail)
         self.local_model_button.clicked.connect(self.local_model_requirement)
+        self.codex_request_button.clicked.connect(self.create_codex_request_card)
+        self.codex_cli_request_button.clicked.connect(self.run_codex_request)
+        self.claude_request_button.clicked.connect(self.run_claude_request)
         import_button.clicked.connect(self.import_codex_plan)
         self.search_button.clicked.connect(self.confirm_and_search)
         save_plan_button.clicked.connect(self.save_plan_only)
@@ -2168,6 +2383,9 @@ class MainWindow(QMainWindow):
     def set_audio_task_busy(self, busy: bool, message: str = "") -> None:
         for name in [
             "local_model_button",
+            "codex_request_button",
+            "codex_cli_request_button",
+            "claude_request_button",
             "search_button",
             "scan_button",
             "rebuild_button",
@@ -2351,6 +2569,153 @@ class MainWindow(QMainWindow):
             f"{model_label} 正在拆解需求…（请稍候，本地模型通常 10–30 秒）",
         )
 
+    def _write_handoff_card(self, card_hint: str = "拖拽给 Codex，等待写回方案") -> Path | None:
+        """Validate the requirement, snapshot the plan baseline, and write a request card.
+
+        Shared by the manual Codex handoff and the automated Claude handoff. Returns the
+        request `.md` path, or None if there is no requirement / writing failed.
+        """
+        requirement = self.requirement_edit.toPlainText().strip()
+        if not requirement:
+            QMessageBox.information(self, "需要需求", "请先在需求框里输入这次要找的声音需求。")
+            return None
+
+        baseline_mtime = 0.0
+        if CURRENT_PLAN_PATH.exists():
+            try:
+                baseline_mtime = CURRENT_PLAN_PATH.stat().st_mtime
+            except OSError:
+                baseline_mtime = 0.0
+
+        title = suggest_title(requirement)
+        slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", title).strip("_")[:42] or "sound_finder_request"
+        request_path = CODEX_REQUEST_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{slug}.md"
+        try:
+            write_codex_request_file(
+                request_path,
+                requirement=requirement,
+                current_plan_path=CURRENT_PLAN_PATH,
+                library_root=self.active_library_root(),
+                result_limit=self.result_limit(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "生成失败", str(exc))
+            return None
+
+        self.codex_request_path = request_path
+        self.codex_plan_baseline_mtime = baseline_mtime
+        if hasattr(self, "codex_request_card"):
+            self.codex_request_card.set_path(str(request_path), card_hint)
+            self.codex_request_card.setVisible(True)
+        return request_path
+
+    def create_codex_request_card(self) -> None:
+        request_path = self._write_handoff_card()
+        if request_path is None:
+            return
+        self.codex_handoff_timer.start()
+        self.statusBar().showMessage(f"已生成 Codex 请求卡：{request_path}")
+
+    def run_codex_request(self) -> None:
+        running = getattr(self, "codex_cli_request_thread", None)
+        if running is not None and running.isRunning():
+            QMessageBox.information(self, "Codex 正在处理", "上一个 Codex 请求还没结束，请稍候。")
+            return
+
+        request_path = self._write_handoff_card("Codex 正在后台处理，写回方案后自动搜索")
+        if request_path is None:
+            return
+
+        self.codex_cli_request_thread = QThread(self)
+        self.codex_cli_request_worker = CodexRequestWorker(request_path, CURRENT_PLAN_PATH, HANDOFF_DIR)
+        self.codex_cli_request_worker.moveToThread(self.codex_cli_request_thread)
+        self.codex_cli_request_thread.started.connect(self.codex_cli_request_worker.run)
+        self.codex_cli_request_worker.progress.connect(self.statusBar().showMessage)
+        self.codex_cli_request_worker.finished.connect(self.on_codex_request_finished)
+        self.codex_cli_request_worker.failed.connect(self.on_codex_request_failed)
+        self.codex_cli_request_worker.finished.connect(self.codex_cli_request_thread.quit)
+        self.codex_cli_request_worker.failed.connect(self.codex_cli_request_thread.quit)
+        self.codex_cli_request_thread.finished.connect(self.codex_cli_request_worker.deleteLater)
+        self.codex_cli_request_thread.finished.connect(self.codex_cli_request_thread.deleteLater)
+        self.codex_cli_request_thread.start()
+
+        self.codex_handoff_timer.start()
+        self.statusBar().showMessage("已生成请求卡，Codex 正在后台处理需求...")
+
+    def run_claude_request(self) -> None:
+        running = getattr(self, "claude_request_thread", None)
+        if running is not None and running.isRunning():
+            QMessageBox.information(self, "Claude 正在处理", "上一个 Claude 请求还没结束，请稍候。")
+            return
+
+        request_path = self._write_handoff_card("Claude 正在后台处理，写回方案后自动搜索")
+        if request_path is None:
+            return
+
+        self.claude_request_thread = QThread(self)
+        self.claude_request_worker = ClaudeRequestWorker(request_path, CURRENT_PLAN_PATH, HANDOFF_DIR)
+        self.claude_request_worker.moveToThread(self.claude_request_thread)
+        self.claude_request_thread.started.connect(self.claude_request_worker.run)
+        self.claude_request_worker.progress.connect(self.statusBar().showMessage)
+        self.claude_request_worker.finished.connect(self.on_claude_request_finished)
+        self.claude_request_worker.failed.connect(self.on_claude_request_failed)
+        self.claude_request_worker.finished.connect(self.claude_request_thread.quit)
+        self.claude_request_worker.failed.connect(self.claude_request_thread.quit)
+        self.claude_request_thread.finished.connect(self.claude_request_worker.deleteLater)
+        self.claude_request_thread.finished.connect(self.claude_request_thread.deleteLater)
+        self.claude_request_thread.start()
+
+        self.codex_handoff_timer.start()
+        self.statusBar().showMessage("已生成请求卡，Claude 正在后台处理需求...")
+
+    def on_codex_request_finished(self, result: dict[str, Any]) -> None:
+        self.statusBar().showMessage("Codex 已写回方案，正在导入并搜索...")
+        self.check_codex_handoff_result()
+
+    def on_codex_request_failed(self, message: str) -> None:
+        self.codex_handoff_timer.stop()
+        if hasattr(self, "codex_request_card") and self.codex_request_path is not None:
+            self.codex_request_card.set_path(str(self.codex_request_path), "Codex 处理失败，可手动拖给 Codex/Claude")
+        QMessageBox.critical(self, "Codex 处理失败", message)
+        self.statusBar().showMessage("Codex 处理失败。")
+
+    def on_claude_request_finished(self, result: dict[str, Any]) -> None:
+        # The plan file is written; trigger an immediate handoff check instead of
+        # waiting up to 2s for the next poll tick. The poll then imports + searches.
+        self.statusBar().showMessage("Claude 已写回方案，正在导入并搜索...")
+        self.check_codex_handoff_result()
+
+    def on_claude_request_failed(self, message: str) -> None:
+        self.codex_handoff_timer.stop()
+        if hasattr(self, "codex_request_card") and self.codex_request_path is not None:
+            self.codex_request_card.set_path(str(self.codex_request_path), "Claude 处理失败，可手动拖给 Codex/Claude")
+        QMessageBox.critical(self, "Claude 处理失败", message)
+        self.statusBar().showMessage("Claude 处理失败。")
+
+    def check_codex_handoff_result(self) -> None:
+        if self.codex_request_path is None:
+            self.codex_handoff_timer.stop()
+            return
+
+        running_thread = getattr(self, "audio_task_thread", None)
+        if running_thread is not None and running_thread.isRunning():
+            return
+
+        if not CURRENT_PLAN_PATH.exists():
+            return
+        try:
+            current_mtime = CURRENT_PLAN_PATH.stat().st_mtime
+        except OSError:
+            return
+        if current_mtime <= self.codex_plan_baseline_mtime:
+            return
+
+        if self.import_plan_from_path(CURRENT_PLAN_PATH, auto_search=True, show_errors=False):
+            self.codex_handoff_timer.stop()
+            if hasattr(self, "codex_request_card"):
+                self.codex_request_card.set_path(str(self.codex_request_path), "Codex 方案已导入，正在自动搜索")
+            self.statusBar().showMessage("已检测到 Codex 写回方案，正在自动搜索。")
+
     def import_codex_plan(self) -> None:
         path = CURRENT_PLAN_PATH
         if not path.exists():
@@ -2364,22 +2729,33 @@ class MainWindow(QMainWindow):
                 return
             path = Path(filename)
 
+        self.import_plan_from_path(path)
+
+    def import_plan_from_path(self, path: Path, *, auto_search: bool = False, show_errors: bool = True) -> bool:
         try:
             title, requirement, plan = read_plan_file(path)
         except Exception as exc:
-            QMessageBox.critical(self, "导入失败", str(exc))
-            return
+            if show_errors:
+                QMessageBox.critical(self, "导入失败", str(exc))
+            else:
+                self.statusBar().showMessage(f"Codex 方案暂时还不能读取：{exc}")
+            return False
 
         if not plan:
-            QMessageBox.information(self, "方案为空", "这个方案文件里没有可搜索的分类。")
-            return
+            if show_errors:
+                QMessageBox.information(self, "方案为空", "这个方案文件里没有可搜索的分类。")
+            return False
 
         self.current_session_id = self.db.create_session(title, requirement)
         self.requirement_edit.setPlainText(requirement)
         self.fill_plan_table(plan)
         self.db.replace_plan(self.current_session_id, requirement, plan)
+        self.db.set_setting("last_session_id", str(self.current_session_id))
         self.load_session(self.current_session_id)
         self.statusBar().showMessage(f"已导入 Codex 方案：{path}")
+        if auto_search:
+            QTimer.singleShot(0, self.confirm_and_search)
+        return True
 
     def export_plan(self) -> None:
         plan = self.read_plan_table()

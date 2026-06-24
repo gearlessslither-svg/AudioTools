@@ -28,6 +28,7 @@ ROOT = Path(r"G:\AI\Material\Wwise")
 REPORT_DIR = ROOT / "\u62A5\u544A"
 RULES_PATH = APP_DIR / "p4_changelist_organizer_rules.json"
 LEARNING_PATH = APP_DIR / "p4_changelist_learning.json"
+OPERATION_LOG_PATH = APP_DIR / "p4_changelist_organizer_operations.log"
 AUDIO_TOOL_REPORT_GLOB = "ProjectEF_AnimationWwiseEvent_AutoConfig_*.json"
 AUDIO_FOOTPRINT_JSON = REPORT_DIR / "ProjectEF_Unity_Audio_Footprint.json"
 
@@ -450,6 +451,48 @@ def safe_p4_description_lines(lines: list[str]) -> list[str]:
     return safe or ["ProjectEF audio selected changes"]
 
 
+def append_operation_log(label: str, text: str) -> None:
+    try:
+        stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with OPERATION_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[{stamp}] {label}\n{text.strip()}\n")
+    except Exception:
+        pass
+
+
+def build_new_change_form(template: str, client: str, user: str, description_lines: list[str]) -> str:
+    fields: list[str] = []
+    for line in template.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        match = re.match(r"^([A-Za-z][A-Za-z0-9]*):", line)
+        if not match:
+            continue
+        field = match.group(1)
+        if field in {"Change", "Client", "User", "Status", "Type", "Description"} and field not in fields:
+            fields.append(field)
+    for field in ("Change", "Client", "User", "Status", "Type", "Description"):
+        if field not in fields:
+            fields.append(field)
+
+    values = {
+        "Change": "new",
+        "Client": client,
+        "User": user,
+        "Status": "new",
+        "Type": "public",
+    }
+    out: list[str] = []
+    for field in fields:
+        if field == "Description":
+            out.append("Description:")
+            out.extend(f"\t{line}" for line in description_lines)
+        else:
+            out.append(f"{field}:\t{values[field]}")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
 def learning_similarity(example: dict[str, Any], row: dict[str, Any], task_goal: str) -> float:
     score = 0.0
     if example.get("repo_kind") and example.get("repo_kind") == row.get("repo_kind"):
@@ -645,19 +688,63 @@ class P4Client:
             opened += len(re.findall(r" - opened for (?:edit|add)\b", text, flags=re.IGNORECASE))
         return opened, messages, errors
 
+    def reconcile_preview(self, paths: list[str]) -> tuple[list[dict[str, str]], list[str]]:
+        """`p4 reconcile -n`: list files changed on disk but NOT yet opened in P4
+        (offline work Perforce can't currently see). Opens nothing — preview only."""
+        found: list[dict[str, str]] = []
+        errors: list[str] = []
+        for index in range(0, len(paths), 20):
+            batch = paths[index : index + 20]
+            try:
+                proc = self.run(["reconcile", "-n", "-e", "-a", "-d"] + batch, timeout=max(self.timeout, 60))
+            except subprocess.TimeoutExpired:
+                errors.append(f"reconcile -n timed out for batch starting at {index}")
+                continue
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            text = "\n".join(p.strip() for p in [proc.stdout, proc.stderr] if p and p.strip())
+            for line in text.splitlines():
+                low = line.lower()
+                if " - " not in line:
+                    continue
+                if "opened for edit" in low or "reconcile to edit" in low:
+                    action = "edit"
+                elif "delete" in low:
+                    action = "delete"
+                elif "add" in low:
+                    action = "add"
+                else:
+                    continue
+                found.append({"file": line.split(" - ", 1)[0].strip(), "action": action})
+            if proc.returncode != 0:
+                low = text.lower()
+                if "no file(s) to reconcile" not in low and "no such file" not in low:
+                    errors.append(text or f"reconcile -n exit {proc.returncode}")
+        return found, errors
+
     def create_changelist(self, description: str) -> tuple[str, str]:
         clean_lines = safe_p4_description_lines(description.splitlines())[:6]
-        attempts = [clean_lines, ["Reconciled offline work"], ["<saved by Perforce>"]]
+        attempts = [clean_lines, ["Reconciled offline work"], ["ProjectEF pending work"]]
         errors: list[str] = []
+        try:
+            template_proc = self.run(["change", "-o"], timeout=max(self.timeout, 10))
+            template_text = template_proc.stdout if template_proc.returncode == 0 else ""
+        except Exception:
+            template_text = ""
         for attempt_lines in attempts:
-            form = (
-                "Change:\tnew\n\n"
-                f"Client:\t{self.client}\n\n"
-                f"User:\t{self.user}\n\n"
-                "Status:\tnew\n\n"
-                "Description:\n"
-            )
-            form += "".join(f"\t{line}\n" for line in attempt_lines)
+            if template_text:
+                form = build_new_change_form(template_text, self.client, self.user, attempt_lines)
+            else:
+                form = (
+                    "Change:\tnew\n\n"
+                    f"Client:\t{self.client}\n\n"
+                    f"User:\t{self.user}\n\n"
+                    "Status:\tnew\n\n"
+                    "Type:\tpublic\n\n"
+                    "Description:\n"
+                )
+                form += "".join(f"\t{line}\n" for line in attempt_lines)
             proc = self.run(["change", "-i"], input_text=form, timeout=max(self.timeout, 10))
             text = (proc.stdout or proc.stderr or "").strip()
             if proc.returncode == 0:
@@ -1479,6 +1566,7 @@ class OrganizerGui(tk.Tk):
     def _p4_operation_failed(self, label: str, exc: Exception) -> None:
         self.set_p4_operation_busy(False)
         self.status_var.set(f"{label} failed: {exc}")
+        append_operation_log(label, f"FAILED\n{exc}")
         messagebox.showerror(f"{label} Failed", str(exc)[:4000])
 
     def entry(self, parent: tk.Misc, label: str, var: tk.StringVar, width_px: int) -> tk.Frame:
@@ -2767,60 +2855,114 @@ class OrganizerGui(tk.Tk):
 
         self.run_p4_operation_async("Reconcile Selected Local", worker, done)
 
+    def collect_new_cl_targets(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        p4_files: list[str] = []
+        local_files: list[str] = []
+        touch_rows: list[dict[str, Any]] = []
+        skipped_missing = 0
+        skipped_empty = 0
+        for row in rows:
+            if row.get("source") == "P4 opened":
+                target = row.get("reopen_target") or row.get("p4_depot") or row.get("full_path")
+                if target:
+                    p4_files.append(str(target))
+                    touch_rows.append(row)
+                else:
+                    skipped_empty += 1
+                continue
+            full_path = row.get("full_path")
+            if full_path and Path(str(full_path)).exists():
+                local_files.append(str(full_path))
+                touch_rows.append(row)
+            else:
+                skipped_missing += 1
+        return {
+            "p4_files": list(dict.fromkeys(p4_files)),
+            "local_files": list(dict.fromkeys(local_files)),
+            "touch_rows": touch_rows,
+            "skipped_missing": skipped_missing,
+            "skipped_empty": skipped_empty,
+        }
+
+    def create_new_cl_for_rows(self, label: str, rows: list[dict[str, Any]], preview_limit: int = 10) -> None:
+        targets = self.collect_new_cl_targets(rows)
+        p4_files: list[str] = targets["p4_files"]
+        local_files: list[str] = targets["local_files"]
+        if not p4_files and not local_files:
+            messagebox.showinfo(
+                label,
+                "No selected files can be moved or reconciled. P4-opened rows need a depot path, and local fallback rows need an existing local path.",
+            )
+            return
+        if not self.confirm_bank_policy_rows(label, targets["touch_rows"]):
+            return
+
+        description = self.selected_changelist_description(rows)
+        preview = "\n".join(str(row.get("rel_path", "")) for row in rows[:preview_limit])
+        if len(rows) > preview_limit:
+            preview += f"\n... {len(rows) - preview_limit} more"
+        if not messagebox.askyesno(
+            label,
+            f"Create one new pending changelist for this selection?\n\n"
+            f"P4-opened files to move: {len(p4_files)}\n"
+            f"Local fallback files to reconcile into the new CL: {len(local_files)}\n"
+            f"Skipped missing local paths: {targets['skipped_missing']}\n"
+            f"Skipped rows without a P4/local target: {targets['skipped_empty']}\n\n"
+            f"{preview}\n\n"
+            "Operations: p4 change -i, p4 reopen -c, and p4 reconcile -e -a -c. No submit/revert/delete/file-content changes.",
+        ):
+            return
+
+        p4_client = self.p4()
+
+        def worker() -> dict[str, Any]:
+            changelist, create_message = p4_client.create_changelist(description)
+            reopen_success = 0
+            reopen_errors: list[str] = []
+            reconcile_opened = 0
+            reconcile_messages: list[str] = []
+            reconcile_errors: list[str] = []
+            if p4_files:
+                reopen_success, reopen_errors = p4_client.reopen(changelist, p4_files)
+            if local_files:
+                reconcile_opened, reconcile_messages, reconcile_errors = p4_client.reconcile(local_files, changelist)
+            return {
+                "changelist": changelist,
+                "create_message": create_message,
+                "reopen_success": reopen_success,
+                "reopen_errors": reopen_errors,
+                "reconcile_opened": reconcile_opened,
+                "reconcile_messages": reconcile_messages,
+                "reconcile_errors": reconcile_errors,
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            text = (
+                f"Created CL {result['changelist']}.\n"
+                f"{result['create_message']}\n"
+                f"Moved P4-opened files: {result['reopen_success']}/{len(p4_files)}\n"
+                f"Reconciled local fallback files into CL {result['changelist']}: "
+                f"{result['reconcile_opened']} opened/add lines from {len(local_files)} files."
+            )
+            messages = result["reconcile_messages"]
+            errors = result["reopen_errors"] + result["reconcile_errors"]
+            if messages:
+                text += "\n\nReconcile output:\n" + "\n".join(messages[:6])
+            if errors:
+                text += "\n\nErrors:\n" + "\n".join(errors[:8])
+            append_operation_log(label, text)
+            self.status_var.set(text[:1000])
+            messagebox.showinfo(label, text[:4000])
+            self.scan()
+
+        self.run_p4_operation_async(label, worker, done)
+
     def move_selected_to_new_cl(self) -> None:
         selected = self.selected_rows()
         if not selected:
-            messagebox.showinfo("Selected -> New CL", "Select one or more P4-opened rows first.")
+            messagebox.showinfo("Selected -> New CL", "Select one or more rows first.")
             return
-        files: list[str] = []
-        skipped_local = 0
-        for row in selected:
-            if row.get("source") != "P4 opened":
-                skipped_local += 1
-                continue
-            target = row.get("reopen_target") or row.get("p4_depot") or row.get("full_path")
-            if target:
-                files.append(str(target))
-        if not files:
-            messagebox.showinfo(
-                "Selected -> New CL",
-                "No selected P4-opened files to move. If the row source says Local fallback, scan with a matching P4 client first.",
-            )
-            return
-        opened_selected = [row for row in selected if row.get("source") == "P4 opened"]
-        if not self.confirm_bank_policy_rows("Selected -> New CL", opened_selected):
-            return
-        description = self.selected_changelist_description(selected)
-        preview = "\n".join(str(row.get("rel_path", "")) for row in selected[:8])
-        if len(selected) > 8:
-            preview += f"\n... {len(selected) - 8} more"
-        if not messagebox.askyesno(
-            "Create New Changelist",
-            f"Create one new pending changelist and move {len(files)} selected P4-opened files into it?\n\n"
-            f"Skipped local fallback rows: {skipped_local}\n\n"
-            f"{preview}\n\n"
-            "Operations: p4 change -i, then p4 reopen -c. No submit/revert/add/delete/file-content changes.",
-        ):
-            return
-        p4_client = self.p4()
-
-        def worker() -> tuple[str, str, int, list[str]]:
-            changelist, create_message = p4_client.create_changelist(description)
-            success, errors = p4_client.reopen(changelist, files)
-            return changelist, create_message, success, errors
-
-        def done(result: tuple[str, str, int, list[str]]) -> None:
-            changelist, create_message, success, errors = result
-            text = f"Created CL {changelist}.\n{create_message}\nMoved {success}/{len(files)} selected files."
-            if skipped_local:
-                text += f"\nSkipped local fallback rows: {skipped_local}"
-            if errors:
-                text += "\n\nErrors:\n" + "\n".join(errors[:8])
-            self.status_var.set(text[:1000])
-            messagebox.showinfo("Selected -> New CL", text[:4000])
-            self.scan()
-
-        self.run_p4_operation_async("Selected -> New CL", worker, done)
+        self.create_new_cl_for_rows("Selected -> New CL", selected, preview_limit=8)
 
     def move_visible_audio_to_new_cl(self) -> None:
         if not self.visible_iids:
@@ -2834,60 +2976,7 @@ class OrganizerGui(tk.Tk):
         if not audio_rows:
             messagebox.showinfo("Visible Audio -> New CL", "No visible audio candidates. Try checking Audio Only or refreshing the Unity repo scan.")
             return
-
-        files: list[str] = []
-        skipped_local = 0
-        for row in audio_rows:
-            if row.get("source") != "P4 opened":
-                skipped_local += 1
-                continue
-            target = row.get("reopen_target") or row.get("p4_depot") or row.get("full_path")
-            if target:
-                files.append(str(target))
-
-        if not files:
-            messagebox.showinfo(
-                "Visible Audio -> New CL",
-                "Visible audio candidates are not P4-opened rows. Use Reconcile Selected Local first for local fallback rows.",
-            )
-            return
-        opened_audio_rows = [row for row in audio_rows if row.get("source") == "P4 opened"]
-        if not self.confirm_bank_policy_rows("Move Visible Audio -> New CL", opened_audio_rows):
-            return
-
-        description = self.selected_changelist_description(audio_rows)
-        preview = "\n".join(str(row.get("rel_path", "")) for row in audio_rows[:10])
-        if len(audio_rows) > 10:
-            preview += f"\n... {len(audio_rows) - 10} more"
-        if not messagebox.askyesno(
-            "Visible Audio -> New CL",
-            f"Create one new pending changelist and move {len(files)} visible audio candidate files into it?\n\n"
-            f"Visible audio rows: {len(audio_rows)}\n"
-            f"Skipped local fallback rows: {skipped_local}\n\n"
-            f"{preview}\n\n"
-            "Operations: p4 change -i, then p4 reopen -c. No submit/revert/add/delete/file-content changes.",
-        ):
-            return
-
-        p4_client = self.p4()
-
-        def worker() -> tuple[str, str, int, list[str]]:
-            changelist, create_message = p4_client.create_changelist(description)
-            success, errors = p4_client.reopen(changelist, files)
-            return changelist, create_message, success, errors
-
-        def done(result: tuple[str, str, int, list[str]]) -> None:
-            changelist, create_message, success, errors = result
-            text = f"Created CL {changelist}.\n{create_message}\nMoved {success}/{len(files)} visible audio candidate files."
-            if skipped_local:
-                text += f"\nSkipped local fallback rows: {skipped_local}"
-            if errors:
-                text += "\n\nErrors:\n" + "\n".join(errors[:8])
-            self.status_var.set(text[:1000])
-            messagebox.showinfo("Move Visible Audio -> New CL", text[:4000])
-            self.scan()
-
-        self.run_p4_operation_async("Move Visible Audio -> New CL", worker, done)
+        self.create_new_cl_for_rows("Visible Audio -> New CL", audio_rows, preview_limit=10)
 
     def apply_moves(self) -> None:
         groups: dict[str, tuple[str, list[str]]] = {

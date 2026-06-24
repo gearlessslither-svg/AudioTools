@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QMimeData, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDrag, QPainter, QPen
+from PySide6.QtGui import QColor, QDesktopServices, QDrag, QPainter, QPen
 from PySide6.QtWidgets import QLabel, QTableWidget, QWidget
 
 
@@ -86,6 +86,46 @@ class DragFileLabel(QLabel):
         drag = QDrag(self)
         drag.setMimeData(mime)
         drag.exec(Qt.CopyAction)
+
+
+class DragDocumentLabel(QLabel):
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self.path = ""
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumHeight(48)
+        self.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.setStyleSheet(
+            """
+            QLabel {
+                border: 1px dashed #75c893;
+                border-radius: 6px;
+                color: #eef8f1;
+                background: #1d2a24;
+                padding: 8px;
+            }
+            """
+        )
+
+    def set_path(self, path: str, title: str = "Codex request ready") -> None:
+        self.path = path
+        if path:
+            self.setText(f"{title}\n{Path(path).name}")
+        else:
+            self.setText("No Codex request card")
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        if not self.path:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(self.path)])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.CopyAction)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        if self.path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.path))
 
 
 class WaveformView(QWidget):

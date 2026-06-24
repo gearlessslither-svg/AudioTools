@@ -28,6 +28,36 @@ dependencies when `requirements.txt` changes.
 
 Clearing the current work area does not delete saved sessions or search results.
 
+## Codex Request Card Mode
+
+If the local model is slow or unavailable, type the requirement in the GUI and click
+`生成 Codex 请求卡`. The tool writes a draggable Markdown request card under:
+
+```text
+handoff/codex_requests/
+```
+
+It also updates:
+
+```text
+handoff/codex_request_latest.md
+```
+
+Drag that card into Codex, or ask Codex to read the latest request. Codex should
+write the completed plan to:
+
+```text
+handoff/current_plan.json
+```
+
+While the request card is active, the GUI watches `current_plan.json`. When Codex
+writes a newer plan, Sound Finder imports it and runs search automatically.
+
+The GUI also provides `用 Codex 处理`, which uses a local Codex CLI executable to
+process the same request card in the background and write `current_plan.json`
+without manual drag-and-drop. If the background CLI is unavailable or times out,
+the request card remains visible and can still be dragged into Codex manually.
+
 ## Local / Remote Model Mode
 
 Click `模型拆解/搜索` in the GUI. The dialog accepts:
@@ -35,10 +65,10 @@ Click `模型拆解/搜索` in the GUI. The dialog accepts:
 - `Auto`: checks remote GPT before each request. If it is reachable and faster than the configured threshold, the request uses the remote model; if it is unavailable or slow, the request uses the local model.
 - `Remote`: forces the remote GPT-compatible endpoint.
 - `Local`: forces the local model.
-- `Ollama`: default `http://127.0.0.1:11434`, model default `qwen3:8b`.
+- `Ollama`: default `http://127.0.0.1:11434`, model default `qwen2.5:7b-instruct`.
 - `OpenAI-compatible / LM Studio`: default `http://127.0.0.1:1234/v1`.
 
-The tool stores the last routing mode, provider, URL, model, timeout, and category limit in the local SQLite settings table. Generated plans are written to `handoff/current_plan.json`, so the old Codex handoff path remains compatible. Status messages include the actual model source, such as `remote:gpt-5-mini` or `local:ollama:qwen3:8b`.
+The tool stores the last routing mode, provider, URL, model, timeout, and category limit in the local SQLite settings table. Generated plans are written to `handoff/current_plan.json`, so the old Codex handoff path remains compatible. Status messages include the actual model source, such as `remote:gpt-5-mini` or `local:ollama:qwen2.5:7b-instruct`.
 
 Recommended local setup for this machine:
 
@@ -55,7 +85,7 @@ ollama pull qwen2.5:7b-instruct
 CLI generation is also available:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 --generate-local-plan "钓鱼游戏背包、购买、奖励、错误反馈 UI 音效" --llm-mode auto --remote-model gpt-5-mini --local-model qwen3:8b
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 --generate-local-plan "钓鱼游戏背包、购买、奖励、错误反馈 UI 音效" --llm-mode auto --remote-model gpt-5-mini --local-model qwen2.5:7b-instruct
 ```
 
 If you want a rule-based fallback when the local model is offline:

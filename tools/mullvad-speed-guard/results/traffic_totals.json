@@ -1,0 +1,12 @@
+{
+  "initialized": true,
+  "total_download_bytes": 196870028,
+  "total_upload_bytes": 95603056,
+  "last_interface": "Mullvad",
+  "last_interface_download_bytes": 0,
+  "last_interface_upload_bytes": 0,
+  "last_sampled_at": "2026-06-18 16:27:50",
+  "last_delta_download_bytes": 0,
+  "last_delta_upload_bytes": 0,
+  "last_reset_reason": null
+}

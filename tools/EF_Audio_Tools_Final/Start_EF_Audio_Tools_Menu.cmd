@@ -5,9 +5,14 @@ setlocal
 :menu
 cls
 echo ===============================================
-echo EF Audio Tools Final
+echo EF Audio / Work Tools Final
 echo ===============================================
 echo.
+echo Work management
+echo 11. Daily Work Notes
+echo 12. Tool Documentation Search GUI
+echo 13. Screenshot To Excel
+  echo.
 echo Main manual tools
 echo 1. Sound Finder for Reaper
 echo 2. Unity/Wwise Log Monitor GUI
@@ -35,7 +40,10 @@ if /I "%CHOICE%"=="7" call "%~dp0\20_UIAudio_StaticInspector_GUI.cmd" & goto men
 if /I "%CHOICE%"=="8" call "%~dp0\21_Animation_Wwise_Event_AutoConfig.cmd" & goto menu
 if /I "%CHOICE%"=="9" call "%~dp0\22_AudioRequirement_Jira_Triage_GUI.cmd" & goto menu
 if /I "%CHOICE%"=="10" call "%~dp0\28_Audio_Debug_Assistant.cmd" & goto menu
-if /I "%CHOICE%"=="A" goto advanced
+if /I "%CHOICE%"=="11" call "%~dp0\29_Daily_Work_Notes.cmd" & goto menu
+if /I "%CHOICE%"=="12" call "%~dp0\31_Tool_Documentation_Search_GUI.cmd" & goto menu
+if /I "%CHOICE%"=="13" call "%~dp0\33_Screenshot_To_Excel.cmd" & goto menu
+  if /I "%CHOICE%"=="A" goto advanced
 if /I "%CHOICE%"=="Q" exit /b 0
 
 echo.

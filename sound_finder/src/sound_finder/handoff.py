@@ -10,6 +10,8 @@ from .recipe import build_recipe_for_category
 
 HANDOFF_DIR = ROOT_DIR / "handoff"
 CURRENT_PLAN_PATH = HANDOFF_DIR / "current_plan.json"
+CODEX_REQUEST_DIR = HANDOFF_DIR / "codex_requests"
+LATEST_CODEX_REQUEST_PATH = HANDOFF_DIR / "codex_request_latest.md"
 
 
 def plan_to_json(title: str, requirement: str, categories: list[PlanCategory]) -> dict[str, Any]:
@@ -78,3 +80,79 @@ def write_plan_file(path: Path, title: str, requirement: str, categories: list[P
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = plan_to_json(title, requirement, categories)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_codex_request_file(
+    path: Path,
+    *,
+    requirement: str,
+    current_plan_path: Path = CURRENT_PLAN_PATH,
+    library_root: str = "",
+    result_limit: int = 200,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    title_hint = requirement.strip().splitlines()[0][:80] if requirement.strip() else "Sound Finder request"
+    content = f"""# Sound Finder Codex Request
+
+Status: waiting_for_codex
+
+## Task
+
+Read this request, analyze the sound requirement, and write a Sound Finder plan JSON to:
+
+```text
+{current_plan_path}
+```
+
+After the JSON file is written, the Sound Finder GUI will import it and run search automatically.
+
+## Requirement
+
+```text
+{requirement.strip()}
+```
+
+## Context
+
+- Title hint: {title_hint}
+- Sound library root: {library_root or "(use the Sound Finder active library)"}
+- Result limit per category: {result_limit}
+
+## Output Schema
+
+Write exactly this JSON structure to `current_plan.json`:
+
+```json
+{{
+  "title": "short Chinese title",
+  "requirement": "original requirement text",
+  "categories": [
+    {{
+      "name": "Chinese category or sound need name",
+      "direction": "brief Chinese direction for sound design",
+      "keywords": ["english search keyword", "another keyword"],
+      "include": true,
+      "recipe_style": "realistic_tactile",
+      "recipe": [
+        {{
+          "name": "layer name",
+          "role": "layer role",
+          "keywords": ["english keyword"],
+          "weight": 1.0
+        }}
+      ]
+    }}
+  ]
+}}
+```
+
+## Rules
+
+- Use English keywords because the local SFX library is indexed mostly by English filenames.
+- Split the requirement into practical searchable categories, not too many tiny fragments.
+- Prefer reusable game-audio layers over one-off over-specific assets.
+- Keep `include` true for categories that should be searched immediately.
+- Use `realistic_tactile` unless the requirement clearly needs another existing recipe style.
+"""
+    path.write_text(content, encoding="utf-8")
+    LATEST_CODEX_REQUEST_PATH.write_text(content, encoding="utf-8")

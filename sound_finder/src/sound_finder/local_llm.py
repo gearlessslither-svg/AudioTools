@@ -21,6 +21,7 @@ DEFAULT_REMOTE_URL = "https://api.openai.com/v1"
 DEFAULT_REMOTE_MODEL = "gpt-5-mini"
 DEFAULT_MODEL = "qwen2.5:7b-instruct"
 DEFAULT_REMOTE_SLOW_MS = 6000
+DEFAULT_TIMEOUT = 180
 # Output token budget for local models. Must comfortably exceed a full plan: ~10
 # categories with directions + keyword arrays runs ~800+ tokens, and 700 truncated
 # the JSON ~1/3 of the time -> parse failure -> bad rule fallback. 2048 gives headroom.
@@ -59,9 +60,9 @@ class LocalModelConfig:
     remote_api_key: str = ""
     remote_slow_ms: int = DEFAULT_REMOTE_SLOW_MS
     temperature: float = 0.2
-    timeout: int = 90
+    timeout: int = DEFAULT_TIMEOUT
     max_categories: int = 10
-    allow_rule_fallback: bool = False
+    allow_rule_fallback: bool = True
 
 
 @dataclass
@@ -104,9 +105,9 @@ def default_config(provider: str | None = None) -> LocalModelConfig:
             DEFAULT_REMOTE_SLOW_MS,
         ),
         temperature=_float_from_text(os.environ.get("SOUND_FINDER_LLM_TEMPERATURE", "0.2"), 0.2),
-        timeout=_int_from_text(os.environ.get("SOUND_FINDER_LLM_TIMEOUT", "90"), 90),
+        timeout=_int_from_text(os.environ.get("SOUND_FINDER_LLM_TIMEOUT", str(DEFAULT_TIMEOUT)), DEFAULT_TIMEOUT),
         max_categories=_int_from_text(os.environ.get("SOUND_FINDER_LLM_MAX_CATEGORIES", "10"), 10),
-        allow_rule_fallback=os.environ.get("SOUND_FINDER_LLM_RULE_FALLBACK", "").lower()
+        allow_rule_fallback=os.environ.get("SOUND_FINDER_LLM_RULE_FALLBACK", "1").lower()
         in {"1", "true", "yes", "on"},
     )
 
@@ -301,9 +302,10 @@ def call_local_model(requirement: str, config: LocalModelConfig) -> str:
 def _call_ollama(requirement: str, config: LocalModelConfig) -> str:
     if not config.model:
         raise LocalModelError("请填写 Ollama 模型名，例如 qwen2.5:7b。")
+    model = _resolve_ollama_model(config)
     url = config.base_url.rstrip("/") + "/api/chat"
     payload = {
-        "model": config.model,
+        "model": model,
         "stream": False,
         "format": "json",
         "options": {"temperature": config.temperature, "num_predict": DEFAULT_LOCAL_NUM_PREDICT},
@@ -315,6 +317,41 @@ def _call_ollama(requirement: str, config: LocalModelConfig) -> str:
     if not content:
         raise LocalModelError(f"Ollama 没有返回 message.content：{response}")
     return str(content)
+
+
+def _resolve_ollama_model(config: LocalModelConfig) -> str:
+    requested = (config.model or "").strip()
+    if not requested:
+        return requested
+    try:
+        installed = _ollama_model_names(config.base_url, config.timeout)
+    except Exception:
+        # If tag probing fails, keep the requested model so the real chat call
+        # reports the actual connection/server problem.
+        return requested
+    if not installed or requested in installed:
+        return requested
+    if DEFAULT_MODEL in installed:
+        config.model = DEFAULT_MODEL
+        return DEFAULT_MODEL
+    installed_text = ", ".join(installed[:12]) or "(none)"
+    raise LocalModelError(
+        f"Ollama model '{requested}' is not installed. Installed models: {installed_text}. "
+        f"Install it with `ollama pull {requested}` or use `{DEFAULT_MODEL}`."
+    )
+
+
+def _ollama_model_names(base_url: str, timeout: int) -> list[str]:
+    url = (base_url or DEFAULT_OLLAMA_URL).rstrip("/") + "/api/tags"
+    payload = _get_json(url, {}, min(max(1, timeout), 10))
+    names: list[str] = []
+    for item in payload.get("models", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "").strip()
+        if name:
+            names.append(name)
+    return names
 
 
 def _call_openai_compatible(requirement: str, config: LocalModelConfig) -> str:
@@ -449,6 +486,8 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeo
         raise LocalModelError(f"HTTP {exc.code} from {url}: {body}") from exc
     except urllib.error.URLError as exc:
         raise LocalModelError(f"无法连接本地模型服务 {url}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise LocalModelError(f"timed out calling {url} after {timeout}s") from exc
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
@@ -466,6 +505,8 @@ def _get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]
         raise LocalModelError(f"HTTP {exc.code} from {url}: {body[:300]}") from exc
     except urllib.error.URLError as exc:
         raise LocalModelError(f"无法连接 {url}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise LocalModelError(f"timed out calling {url} after {timeout}s") from exc
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:

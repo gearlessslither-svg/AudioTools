@@ -1,5 +1,5 @@
 {
-  "folder_purpose": "Final user-facing launchers for EF audio tools. Original tools remain in their source folders.",
+  "folder_purpose": "Final user-facing launchers for EF audio and Windows workflow tools. Original tools remain in their source folders.",
   "gui_launcher": "Start_EF_Audio_Tools_GUI.cmd",
   "menu_launcher": "Start_EF_Audio_Tools_Menu.cmd",
   "tools": [
@@ -182,7 +182,7 @@
       "visible": true,
       "launcher": "21_Animation_Wwise_Event_AutoConfig.cmd",
       "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AnimationWwiseEvent_AutoConfig_GUI.cmd",
-      "purpose": "GUI for locating Unity .fbx/.anim clips and Wwise Events, previewing analyzed motion keyframes such as bird wing downstrokes, opening a Unity Editor preview window for actual prefab animation playback with markers, applying Animation Event configuration, and ensuring a generic receiver component exists without modifying WwiseAudioHelper."
+      "purpose": "Main GUI for audio-to-motion configuration. It configures Wwise Animation Events on Unity .fbx/.anim clips, and now includes a Round Info / Task Card intake for mixed animation, timeline, VFX, prefab, and UI requests. Task cards are read-only analysis records; actual writes still go through Preview/Apply. Supports batch text intake, OCR, multi-result preview selection, Wwise Event validation, Unity preview requests, reports, and receiver component setup without modifying WwiseAudioHelper."
     },
     {
       "menu": "22",
@@ -242,6 +242,55 @@
       "launcher": "28_Audio_Debug_Assistant.cmd",
       "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_Audio_Debug_Assistant.cmd",
       "purpose": "Scenario-level Wwise and Unity/Wwise debug assistant. Type an Event, Wwise node, or issue description; it runs read-only Wwise local checks with WAAPI/Profiler and reuses the Unity/Wwise log monitor rules for game integration diagnosis."
+    },
+    {
+      "menu": "29",
+      "name": "Daily Work Notes",
+      "visible": true,
+      "launcher": "29_Daily_Work_Notes.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\EF_Audio_Tools_Final\\EF_Work_Notes.py",
+      "purpose": "General Windows work manager for today's tasks, project-based completed pools, automatic date sync, unfinished-item rollover, search, priority, and Markdown/JSON export."
+    },
+    {
+      "menu": "30",
+      "name": "Audio Identity Overlay Map Export",
+      "visible": true,
+      "launcher": "30_Audio_Identity_Overlay_MapExport.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioIdentityOverlay_MapExport.cmd",
+      "purpose": "Refresh the Unity Editor-only Resource Name Overlay identity map from P4 audio history learning, Unity audio footprint reports, and animation Wwise auto-config reports. It only writes the local overlay JSON map and does not modify Wwise, runtime audio loading, P4 changelists, or game prefabs."
+    },
+    {
+      "menu": "31",
+      "name": "Tool Documentation Search GUI",
+      "visible": true,
+      "launcher": "31_Tool_Documentation_Search_GUI.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_Tool_Documentation_Search_GUI.cmd",
+      "purpose": "Generate Markdown documentation from the latest ProjectEF audio tool launchers and source code, search/view the generated docs in a GUI, and optionally explain search results through local Ollama or remote OpenAI-compatible models."
+    },
+    {
+      "menu": "32",
+      "name": "Audio Codex Task Card Generator",
+      "visible": false,
+      "hidden_reason": "Internal analysis module now integrated into Animation Wwise Event AutoConfig GUI.",
+      "launcher": "32_Audio_Codex_Task_Card.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioCodexTaskCard_GUI.cmd",
+      "purpose": "Read-only GUI for collecting animation, timeline, VFX, prefab, and UI audio configuration requests into a structured Codex task card. It scans candidate Unity assets and references, summarizes likely configuration owners, and writes Markdown/JSON cards without modifying Unity, Wwise, P4, or project runtime audio logic."
+    },
+    {
+      "menu": "33",
+      "name": "Screenshot To Excel",
+      "visible": true,
+      "launcher": "33_Screenshot_To_Excel.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_Screenshot_To_Excel.cmd",
+      "purpose": "Run-test screenshot evidence capture tool. It watches clipboard screenshots, Win+PrintScreen folders, and Xbox Game Bar captures, then writes a timestamped Excel report with original image paths, thumbnails, capture time, source, size, and a notes column."
+    },
+    {
+      "menu": "34",
+      "name": "Audio Jira Creator GUI",
+      "visible": true,
+      "launcher": "34_AudioJira_Creator_GUI.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioJira_Creator_GUI.cmd",
+      "purpose": "Create PROEF audio Jira issues from a title + involved disciplines. Template-filled description, disciplines->components mapping, full preview, POST only after explicit confirm. Reuses Jira Triage cookie; Learn button pulls valid types/components from createmeta. Jira is internal (needs Mullvad off)."
     }
   ]
 }

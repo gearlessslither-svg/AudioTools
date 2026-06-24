@@ -128,6 +128,7 @@ class AnalysisResult:
     clip_length: float
     endpoint_paths: list[str]
     y_range: tuple[float, float] | None = None
+    notes: list[str] | None = None
 
 
 @dataclass
@@ -180,7 +181,19 @@ def guid_from_meta(asset_path: Path) -> str:
 
 
 def fuzzy_asset_key(value: str) -> str:
-    return re.sub(r"\d+", "", value.replace("\\", "/").lower())
+    key = re.sub(r"\d+", "", value.replace("\\", "/").lower())
+    parts = re.split(r"([_/.\-])", key)
+    normalized: list[str] = []
+    for part in parts:
+        if part in {"_", "/", ".", "-"}:
+            normalized.append(part)
+        elif part == "clip":
+            normalized.append("clp")
+        elif part == "ul":
+            normalized.append("ui")
+        else:
+            normalized.append(part.replace("waik", "walk"))
+    return "".join(normalized)
 
 
 def resolve_asset(root: Path, query: str, suffix: str) -> Path:
@@ -479,10 +492,15 @@ def parse_float_quat(text: str) -> tuple[float, float, float, float]:
     )
 
 
-def parse_animation_clip(path: Path) -> tuple[str, float, list[Curve]]:
+def read_animation_clip_text_and_length(path: Path) -> tuple[str, float]:
     text = read_text(path)
     stop_match = re.search(r"^\s+m_StopTime:\s*([0-9.eE+-]+)\s*$", text, re.M)
     clip_length = float(stop_match.group(1)) if stop_match else 0.0
+    return text, clip_length
+
+
+def parse_animation_clip(path: Path) -> tuple[str, float, list[Curve]]:
+    text, clip_length = read_animation_clip_text_and_length(path)
 
     start = text.find("  m_RotationCurves:")
     end = text.find("  m_EulerCurves:", start)
@@ -757,7 +775,21 @@ def analyze_with_prefab(
 
     velocities = [sample.get("v", 0.0) for sample in samples]
     y_values = [sample["y"] for sample in samples]
-    if mode == "downstroke":
+    if mode == "contact":
+        y_min = min(y_values)
+        y_max = max(y_values)
+        y_span = max(0.0, y_max - y_min)
+        threshold = y_min + (y_span * strength_ratio)
+        candidates = [
+            {"t": samples[i]["t"], "metric": y_max - samples[i]["y"]}
+            for i in range(2, len(samples) - 2)
+            if samples[i]["y"] <= samples[i - 1]["y"]
+            and samples[i]["y"] <= samples[i + 1]["y"]
+            and samples[i]["y"] <= threshold
+        ]
+        strongest = y_span
+        metric = "low_y_contact"
+    elif mode == "downstroke":
         strongest = abs(min(velocities))
         threshold = strongest * strength_ratio
         candidates = [
@@ -793,6 +825,254 @@ def analyze_with_prefab(
         endpoint_paths=endpoint_paths,
         y_range=(min(y_values), max(y_values)),
     )
+
+
+def parse_event_times(value: str | None, clip_length: float) -> list[float]:
+    if not value or not value.strip():
+        return [0.0]
+
+    times: list[float] = []
+    for raw_part in re.split(r"[,;\s]+", value.strip()):
+        part = raw_part.strip().lower()
+        if not part:
+            continue
+        if part in {"start", "begin"}:
+            time_value = 0.0
+        elif part in {"mid", "middle", "center"}:
+            time_value = clip_length * 0.5
+        elif part in {"end", "finish"}:
+            time_value = clip_length
+        elif part.endswith("%"):
+            ratio = float(part[:-1]) / 100.0
+            time_value = clip_length * ratio
+        else:
+            time_value = float(part)
+        time_value = max(0.0, min(clip_length, time_value)) if clip_length > 0.0 else max(0.0, time_value)
+        times.append(round(time_value, 6))
+
+    deduped = sorted(set(times))
+    if not deduped:
+        raise ToolError("No valid manual event times were parsed.")
+    return deduped
+
+
+def extract_wwise_event_from_text(text: str) -> str | None:
+    field_match = re.search(
+        r"(?i)\b(?:wwise\s*)?event(?:\s*name)?\s*(?:为|=|:|：)?\s*([A-Za-z0-9_.-]+)",
+        text,
+    )
+    if field_match:
+        return field_match.group(1).strip()
+
+    name_match = re.search(r"\b(?:Play|Stop|Pause|Resume|Set|Reset|Post)_[A-Za-z0-9_.-]+\b", text)
+    return name_match.group(0).strip() if name_match else None
+
+
+def extract_animation_query_from_text(text: str) -> str | None:
+    queries = extract_animation_queries_from_text(text)
+    return queries[0] if queries else None
+
+
+def extract_animation_queries_from_text(text: str) -> list[str]:
+    field_patterns = [
+        r"(?i)\bAnimation\s+Clip\s*(?:name)?\s*(?:为|=|:|：)\s*([A-Za-z0-9_.\\/-]+)",
+        r"(?i)\bAnimation\s*(?:name)?\s*(?:为|=|:|：)\s*([A-Za-z0-9_.\\/-]+)",
+        r"(?i)\bAnimation\s+([A-Za-z0-9_.\\/-]+)",
+        r"(?i)\b(?:Anim|AnimationClip)\b\s*(?:Clip)?\s*(?:name)?\s*(?:为|=|:|：)\s*([A-Za-z0-9_.\\/-]+)",
+        r"(?i)\b(?:Clip|File|Filename)\b\s*(?:name)?\s*(?:为|=|:|：)\s*([A-Za-z0-9_.\\/-]+)",
+        r"(?:文件名|动画)\s*(?:为|=|:|：)?\s*([A-Za-z0-9_.\\/-]+)",
+    ]
+    values: list[str] = []
+    seen_values: set[str] = set()
+
+    def add_value(value: str) -> None:
+        value = value.strip()
+        if not value or extract_wwise_event_from_text(value):
+            return
+        key = fuzzy_asset_key(value)
+        if key in seen_values:
+            return
+        seen_values.add(key)
+        values.append(value)
+
+    for pattern in field_patterns:
+        for match in re.finditer(pattern, text):
+            add_value(match.group(1))
+
+    candidates = re.findall(r"\b[A-Za-z][A-Za-z0-9.-]*(?:_[A-Za-z0-9.-]+){1,}\b", text)
+    filtered = [
+        item
+        for item in candidates
+        if not re.match(r"(?i)^(?:Play|Stop|Pause|Resume|Set|Reset|Post)_", item)
+    ]
+
+    def score(value: str) -> tuple[int, int]:
+        lowered = value.lower()
+        points = 0
+        for token, weight in [("clip", 8), ("clp", 8), ("ani", 5), ("anim", 5), ("walk", 2), ("run", 2)]:
+            if token in lowered:
+                points += weight
+        points += value.count("_")
+        return points, len(value)
+
+    for candidate in sorted(filtered, key=score, reverse=True):
+        candidate_score, _length = score(candidate)
+        if candidate_score < 3:
+            continue
+        add_value(candidate)
+    return values
+
+
+def extract_event_times_text(text: str) -> str | None:
+    match = re.search(
+        r"(?i)\b(?:event\s*)?times?\s*(?:为|=|:|：|@)\s*([A-Za-z0-9.,;%\s+-]+)",
+        text,
+    )
+    if not match:
+        return None
+    value = match.group(1).strip(" \t\r\n,;")
+    return value or None
+
+
+def parse_batch_entries(text: str, default_event_times: str = "") -> list[dict[str, str]]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    raw_blocks = [block.strip() for block in re.split(r"\n\s*\n+", normalized) if block.strip()]
+    line_blocks = [line.strip() for line in normalized.splitlines() if line.strip()]
+    full_block = normalized.strip()
+    blocks = ([full_block] if full_block else []) + raw_blocks + [line for line in line_blocks if line not in raw_blocks]
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_entry(animation: str, event: str, event_times: str, source_text: str) -> None:
+        key = (animation.strip(), event.strip(), event_times.strip())
+        if not key[0] or not key[1] or key in seen:
+            return
+        seen.add(key)
+        entries.append(
+            {
+                "animation": key[0],
+                "event": key[1],
+                "event_times": key[2],
+                "source_text": source_text,
+            }
+        )
+
+    for block in blocks:
+        if "\n" in block and len(re.findall(r"\b(?:Play|Stop|Pause|Resume|Set|Reset|Post)_[A-Za-z0-9_.-]+\b", block)) > 1:
+            continue
+        pipe_parts = [part.strip() for part in re.split(r"\s*(?:\||\t|=>|->)\s*", block) if part.strip()]
+        pipe_event = extract_wwise_event_from_text(pipe_parts[1]) if len(pipe_parts) >= 2 else None
+        if len(pipe_parts) >= 2 and pipe_event:
+            animation = extract_animation_query_from_text(pipe_parts[0]) or pipe_parts[0]
+            event = pipe_event
+            event_times = pipe_parts[2] if len(pipe_parts) >= 3 else default_event_times
+            if animation and event:
+                add_entry(animation, event, event_times, block)
+        else:
+            animations = extract_animation_queries_from_text(block)
+            event = extract_wwise_event_from_text(block)
+            event_times = extract_event_times_text(block) or default_event_times
+            if event:
+                for animation in animations:
+                    add_entry(animation, event, event_times, block)
+
+    return entries
+
+
+def analyze_manual_times(clip_length: float, times: list[float], notes: list[str] | None = None) -> AnalysisResult:
+    return AnalysisResult(
+        times=times,
+        mode="manual",
+        metric="fixed_time",
+        threshold=0.0,
+        strongest_metric=0.0,
+        sample_fps=0.0,
+        min_gap=0.0,
+        selection_policy="manual",
+        clip_length=clip_length,
+        endpoint_paths=[],
+        notes=notes or [],
+    )
+
+
+def looks_like_ui_or_one_shot(animation_path: Path, event_name: str) -> bool:
+    text = f"{animation_path.stem} {event_name}".lower()
+    return any(token in text for token in ["ui", "loading", "menu", "button", "popup", "panel", "hud"])
+
+
+def looks_like_step_motion(animation_path: Path, event_name: str) -> bool:
+    text = f"{animation_path.stem} {event_name}".lower()
+    return any(token in text for token in ["walk", "run", "step", "foot", "paw", "cat", "dog", "hoof"])
+
+
+def choose_auto_analysis(
+    *,
+    animation_path: Path,
+    event_name: str,
+    clip_length: float,
+    curves: list[Curve],
+    prefab_path: Path | None,
+    sample_fps: float,
+    strength_ratio: float,
+    min_gap: float,
+    selection_policy: str,
+    manual_times: list[float],
+) -> AnalysisResult:
+    notes: list[str] = []
+
+    if looks_like_ui_or_one_shot(animation_path, event_name):
+        notes.append("Auto selected manual timing because the clip/event name looks UI or one-shot oriented.")
+        return analyze_manual_times(clip_length, manual_times, notes)
+
+    root_names = {curve.path.split("/")[0] for curve in curves if curve.path}
+    if prefab_path:
+        transforms, _prefab_text = parse_prefab_transforms(prefab_path, root_names)
+        foot_paths = choose_endpoint_paths(transforms, r"foot|paw|toe|hoof|ankle")
+        wing_paths = choose_endpoint_paths(transforms, r"wing|hand|arm|tail")
+
+        if foot_paths and (looks_like_step_motion(animation_path, event_name) or not wing_paths):
+            notes.append("Auto selected contact timing from foot/paw/toe style endpoints.")
+            analysis = analyze_with_prefab(
+                clip_length,
+                curves,
+                transforms,
+                r"foot|paw|toe|hoof|ankle",
+                "contact",
+                sample_fps,
+                strength_ratio,
+                min_gap,
+                selection_policy,
+            )
+            analysis.notes = (analysis.notes or []) + notes
+            return analysis
+
+        if wing_paths:
+            notes.append("Auto selected downstroke timing from wing/hand/arm/tail style endpoints.")
+            analysis = analyze_with_prefab(
+                clip_length,
+                curves,
+                transforms,
+                r"wing|hand|arm|tail",
+                "downstroke",
+                sample_fps,
+                strength_ratio,
+                min_gap,
+                selection_policy,
+            )
+            analysis.notes = (analysis.notes or []) + notes
+            return analysis
+
+    notes.append("Auto selected generic rotation speed timing.")
+    analysis = analyze_rotation_speed(
+        clip_length,
+        curves,
+        sample_fps,
+        strength_ratio,
+        min_gap,
+        selection_policy,
+    )
+    analysis.notes = (analysis.notes or []) + notes
+    return analysis
 
 
 def analyze_rotation_speed(
@@ -1185,6 +1465,7 @@ def build_report(
             "endpoint_count": len(analysis.endpoint_paths),
             "endpoint_paths": analysis.endpoint_paths,
             "y_range": analysis.y_range,
+            "notes": analysis.notes or [],
         },
         "changed_files": changed_files,
         "p4_reconcile": p4_reconcile,
@@ -1222,9 +1503,15 @@ def write_report(report: dict[str, object], event_name: str) -> tuple[Path, Path
         "",
         ", ".join(f"{time:.3f}" for time in analysis["event_times"]),  # type: ignore[index]
         "",
-        "## Wwise Design Notes",
+        "## Analysis Notes",
         "",
     ]
+    md.extend(f"- {note}" for note in analysis.get("notes", []))  # type: ignore[union-attr]
+    md.extend([
+        "",
+        "## Wwise Design Notes",
+        "",
+    ])
     md.extend(f"- {note}" for note in report["wwise_design"]["notes"])  # type: ignore[index]
     md.extend([
         "",
@@ -1243,7 +1530,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--animation", required=True, help="AnimationClip .anim/.fbx path, file name, or stem.")
     parser.add_argument("--wwise-event", required=True, help="Wwise Event name to post from Animation Events.")
     parser.add_argument("--prefab", help="Prefab path, file name, or stem. Defaults to sibling Prefabs/*.prefab.")
-    parser.add_argument("--mode", choices=["downstroke", "speed"], default="downstroke")
+    parser.add_argument("--mode", choices=["auto", "manual", "contact", "downstroke", "speed"], default="auto")
+    parser.add_argument(
+        "--event-times",
+        help="Manual event times for --mode manual or auto UI fallback. Accepts seconds, start/mid/end, or percentages.",
+    )
     parser.add_argument("--endpoint-regex", default=r"wing|hand")
     parser.add_argument("--sample-fps", type=float, default=60.0)
     parser.add_argument("--strength-ratio", type=float, default=0.30)
@@ -1270,8 +1561,8 @@ def main(argv: list[str]) -> int:
     animation_path, source_animation_path = resolve_animation_asset(unity_root, args.animation)
     prefab_path = resolve_prefab(unity_root, animation_path, args.prefab)
 
-    animation_text, clip_length, curves = parse_animation_clip(animation_path)
-    root_names = {curve.path.split("/")[0] for curve in curves if curve.path}
+    animation_text, clip_length = read_animation_clip_text_and_length(animation_path)
+    manual_times = parse_event_times(args.event_times, clip_length)
     wwise_validation = validate_wwise_event(wwise_root, args.wwise_event)
     wwise_design = analyze_wwise_event_design(
         wwise_root,
@@ -1282,28 +1573,64 @@ def main(argv: list[str]) -> int:
     effective_min_gap = wwise_design.effective_min_gap
     selection_policy = "first_after_gap" if wwise_design.audio_aware_spacing_applied else "strongest"
 
-    if prefab_path:
-        transforms, _prefab_text = parse_prefab_transforms(prefab_path, root_names)
-        analysis = analyze_with_prefab(
+    if args.mode == "manual":
+        analysis = analyze_manual_times(
             clip_length,
-            curves,
-            transforms,
-            args.endpoint_regex,
-            args.mode,
-            args.sample_fps,
-            args.strength_ratio,
-            effective_min_gap,
-            selection_policy,
+            manual_times,
+            ["Manual timing selected by user."],
         )
     else:
-        analysis = analyze_rotation_speed(
-            clip_length,
-            curves,
-            args.sample_fps,
-            args.strength_ratio,
-            effective_min_gap,
-            selection_policy,
-        )
+        try:
+            _parsed_text, parsed_clip_length, curves = parse_animation_clip(animation_path)
+            clip_length = parsed_clip_length or clip_length
+        except ToolError as exc:
+            if args.mode == "auto":
+                analysis = analyze_manual_times(
+                    clip_length,
+                    manual_times,
+                    [f"Auto fell back to manual timing because motion curves were not analyzable: {exc}"],
+                )
+            else:
+                raise
+        else:
+            if args.mode == "auto":
+                analysis = choose_auto_analysis(
+                    animation_path=animation_path,
+                    event_name=args.wwise_event,
+                    clip_length=clip_length,
+                    curves=curves,
+                    prefab_path=prefab_path,
+                    sample_fps=args.sample_fps,
+                    strength_ratio=args.strength_ratio,
+                    min_gap=effective_min_gap,
+                    selection_policy=selection_policy,
+                    manual_times=manual_times,
+                )
+            elif prefab_path:
+                root_names = {curve.path.split("/")[0] for curve in curves if curve.path}
+                transforms, _prefab_text = parse_prefab_transforms(prefab_path, root_names)
+                analysis = analyze_with_prefab(
+                    clip_length,
+                    curves,
+                    transforms,
+                    args.endpoint_regex,
+                    args.mode,
+                    args.sample_fps,
+                    args.strength_ratio,
+                    effective_min_gap,
+                    selection_policy,
+                )
+            elif args.mode == "contact":
+                raise ToolError("Contact mode requires a prefab so foot/paw/toe endpoints can be resolved.")
+            else:
+                analysis = analyze_rotation_speed(
+                    clip_length,
+                    curves,
+                    args.sample_fps,
+                    args.strength_ratio,
+                    effective_min_gap,
+                    selection_policy,
+                )
 
     if not analysis.times:
         raise ToolError("No event times selected. Try lowering --strength-ratio or --min-gap.")
@@ -1372,6 +1699,10 @@ def main(argv: list[str]) -> int:
         f"(requested {args.min_gap:.3f}s, audio-aware {not args.disable_audio_aware_spacing})"
     )
     print(f"Mode: {analysis.mode}, metric: {analysis.metric}")
+    if analysis.notes:
+        print("Analysis notes:")
+        for note in analysis.notes:
+            print(f"- {note}")
     print(f"Selection policy: {analysis.selection_policy}")
     print(f"Generated events: {generated_count}, replaced old target events: {replaced_count}")
     print(f"Event count: {len(analysis.times)}")
