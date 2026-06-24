@@ -1389,6 +1389,8 @@ class OrganizerGui(tk.Tk):
         self.reconcile_button.pack(side=tk.LEFT, padx=4)
         self.bank_reconcile_button = self.button(apply_panel, "Reconcile WwiseBanks", self.reconcile_wwisebanks, bg=PRIMARY, fg=PRIMARY_INK, active_bg=PRIMARY_ACTIVE)
         self.bank_reconcile_button.pack(side=tk.LEFT, padx=4)
+        self.detect_offline_button = self.button(apply_panel, "检测离线音频改动", self.detect_offline_audio_changes, bg="#7a5c2e")
+        self.detect_offline_button.pack(side=tk.LEFT, padx=4)
         self.selected_new_cl_button = self.button(apply_panel, "Selected -> New CL", self.move_selected_to_new_cl, bg="#2f6f5e")
         self.selected_new_cl_button.pack(side=tk.LEFT, padx=4)
         self.visible_audio_new_cl_button = self.button(apply_panel, "Move Visible Audio -> New CL", self.move_visible_audio_to_new_cl, bg="#2f6f5e")
@@ -2795,6 +2797,57 @@ class OrganizerGui(tk.Tk):
             self.scan()
 
         self.run_p4_operation_async("Reconcile WwiseBanks", worker, done)
+
+    def detect_offline_audio_changes(self) -> None:
+        """Fast, SCOPED reconcile -n: only the known audio paths (AutoConfig targets +
+        audio scan roots + WwiseBanks), not the whole project. Lists files changed on
+        disk but not yet opened in P4, and offers to reconcile them into a changelist."""
+        root = self.profile_root()
+        profile = self.profile()
+        scope: list[str] = []
+        for info in load_audio_tool_touch_index().values():
+            p = info.get("path")
+            if p and os.path.exists(p):
+                scope.append(str(p))
+        for d in unity_local_scan_roots(root):
+            scope.append(str(d))
+        try:
+            scope.extend(wwisebank_reconcile_paths(profile, root))
+        except Exception:  # noqa: BLE001
+            pass
+        scope = sorted({s for s in scope if os.path.exists(s)})
+        if not scope:
+            messagebox.showinfo("检测离线音频改动", "没有可检测的音频范围(先跑 AutoConfig,或确认音频目录存在)。")
+            return
+        paths = [s + ("/..." if os.path.isdir(s) else "") for s in scope]
+        p4_client = self.p4()
+
+        def worker() -> tuple[list[dict[str, str]], list[str]]:
+            return p4_client.reconcile_preview(paths)
+
+        def done(result: tuple[list[dict[str, str]], list[str]]) -> None:
+            found, errors = result
+            if not found:
+                msg = "该精准范围内没有 P4 未跟踪的离线改动。"
+                if errors:
+                    msg += "\n\n注意:\n" + "\n".join(errors[:4])
+                self.status_var.set(msg[:300])
+                messagebox.showinfo("检测离线音频改动", msg[:2000])
+                return
+            lines = [f"[{f['action']}] {f['file']}" for f in found]
+            preview = "\n".join(lines[:40]) + (f"\n... 还有 {len(lines) - 40} 个" if len(lines) > 40 else "")
+            self.status_var.set(f"离线音频改动: {len(found)} 个(精准范围)")
+            edit_files = [f["file"] for f in found if f["action"] == "edit"]
+            text = f"发现 {len(found)} 个需要进 CL 的离线改动:\n\n{preview}"
+            if edit_files and messagebox.askyesno("检测离线音频改动", text + f"\n\n是否把其中 {len(edit_files)} 个已改文件 reconcile 进 changelist?"):
+                opened, messages, errs = p4_client.reconcile(edit_files)
+                out = f"已 reconcile,opened/add: {opened}\n" + "\n".join((messages or errs)[:5])
+                messagebox.showinfo("Reconcile", out[:3000])
+                self.scan()
+            else:
+                messagebox.showinfo("检测离线音频改动", text[:3000])
+
+        self.run_p4_operation_async("检测离线音频改动", worker, done)
 
     def reconcile_selected_local(self) -> None:
         selected = self.selected_rows()
