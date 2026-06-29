@@ -12,6 +12,8 @@ echo Work management
 echo 11. Daily Work Notes
 echo 12. Tool Documentation Search GUI
 echo 13. Screenshot To Excel
+echo 14. Tool Inventory HTML
+echo 15. REAPER Project Manager
   echo.
 echo Main manual tools
 echo 1. Sound Finder for Reaper
@@ -43,6 +45,8 @@ if /I "%CHOICE%"=="10" call "%~dp0\28_Audio_Debug_Assistant.cmd" & goto menu
 if /I "%CHOICE%"=="11" call "%~dp0\29_Daily_Work_Notes.cmd" & goto menu
 if /I "%CHOICE%"=="12" call "%~dp0\31_Tool_Documentation_Search_GUI.cmd" & goto menu
 if /I "%CHOICE%"=="13" call "%~dp0\33_Screenshot_To_Excel.cmd" & goto menu
+if /I "%CHOICE%"=="14" call "%~dp0\35_ToolInventory_HTML.cmd" & goto menu
+if /I "%CHOICE%"=="15" call "%~dp0\36_Reaper_Project_Manager.cmd" & goto menu
   if /I "%CHOICE%"=="A" goto advanced
 if /I "%CHOICE%"=="Q" exit /b 0
 

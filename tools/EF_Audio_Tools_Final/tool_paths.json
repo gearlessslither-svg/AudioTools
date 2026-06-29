@@ -291,6 +291,22 @@
       "launcher": "34_AudioJira_Creator_GUI.cmd",
       "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioJira_Creator_GUI.cmd",
       "purpose": "Create PROEF audio Jira issues from a title + involved disciplines. Template-filled description, disciplines->components mapping, full preview, POST only after explicit confirm. Reuses Jira Triage cookie; Learn button pulls valid types/components from createmeta. Jira is internal (needs Mullvad off)."
+    },
+    {
+      "menu": "35",
+      "name": "Tool Inventory HTML",
+      "visible": true,
+      "launcher": "35_ToolInventory_HTML.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_ToolInventory_HTML.cmd",
+      "purpose": "Open a local refreshable HTML inventory that maps ProjectEF audio tools to launchers, scripts, helper files, Unity/P4 candidates, and submit rules such as local-only tool, Unity Editor tool, runtime script that must ship with prefab/object, or review-only generated data."
+    },
+    {
+      "menu": "36",
+      "name": "REAPER Project Manager",
+      "visible": true,
+      "launcher": "36_Reaper_Project_Manager.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_Reaper_Project_Manager.cmd",
+      "purpose": "Local GUI for scanning and managing REAPER .rpp projects. Shows all projects under a chosen root, sorts by modified/created date, name, size, or match count, filters by filename/path keywords, optionally searches inside .rpp text, and can open projects, reveal folders, copy paths, or export CSV."
     }
   ]
 }
