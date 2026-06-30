@@ -106,10 +106,11 @@ class App:
             self._log("守护已在运行。")
             return
         try:
+            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")  # child emits UTF-8
             self.daemon_proc = subprocess.Popen(
                 [sys.executable, "-u", "-B", str(DAEMON)], cwd=str(TOOLS),  # -u: unbuffered -> live output
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                encoding="utf-8", errors="replace", bufsize=1, creationflags=NO_WINDOW)
+                encoding="utf-8", errors="replace", bufsize=1, env=env, creationflags=NO_WINDOW)
         except Exception as exc:  # noqa: BLE001
             self._log(f"[启动失败] {exc}")
             return

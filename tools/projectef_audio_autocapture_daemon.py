@@ -235,6 +235,12 @@ def run(unity_root: Path, wwise_root: Path, interval: int, once: bool) -> int:
 
 
 def main() -> int:
+    # Emit UTF-8 even when stdout is a pipe (GUI reads it as UTF-8). Without this,
+    # Windows defaults to the locale codepage (GBK) and Chinese shows as mojibake.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
     ap = argparse.ArgumentParser(description="ProjectEF audio auto-capture daemon")
     ap.add_argument("--unity-root", default=str(DEFAULT_UNITY_ROOT))
     ap.add_argument("--wwise-root", default=str(DEFAULT_WWISE_ROOT))
