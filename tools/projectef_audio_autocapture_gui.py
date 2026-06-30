@@ -107,9 +107,9 @@ class App:
             return
         try:
             self.daemon_proc = subprocess.Popen(
-                [sys.executable, "-B", str(DAEMON)], cwd=str(TOOLS),
+                [sys.executable, "-u", "-B", str(DAEMON)], cwd=str(TOOLS),  # -u: unbuffered -> live output
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+                encoding="utf-8", errors="replace", bufsize=1, creationflags=NO_WINDOW)
         except Exception as exc:  # noqa: BLE001
             self._log(f"[启动失败] {exc}")
             return

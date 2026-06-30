@@ -186,11 +186,15 @@ def read_new_audio_lines(logs: list[Path], offsets: dict[str, int], known_events
     return out
 
 
+HEARTBEAT_SEC = 20
+
+
 def run(unity_root: Path, wwise_root: Path, interval: int, once: bool) -> int:
     known_events = load_known_events(wwise_root)
     offsets: dict[str, int] = {}
     session: Session | None = None
-    print(f"[autocapture] start; reuse_monitor={_HAVE_MON}; captures -> {CAPTURE_DIR}")
+    last_hb = 0.0
+    print(f"[autocapture] start; reuse_monitor={_HAVE_MON}; captures -> {CAPTURE_DIR}", flush=True)
     while True:
         # Only the two real RUNTIME logs: Editor.log (editor Play mode) and Player.log
         # (standalone Windows build). Excludes editor housekeeping logs (AssetImport/
@@ -202,15 +206,25 @@ def run(unity_root: Path, wwise_root: Path, interval: int, once: bool) -> int:
 
         if session is None and (active_now or new_lines):
             session = Session(unity_root)
-            print(f"[autocapture] session START @ {session.start_iso} (logs={len(logs)})")
+            print(f"[autocapture] session START @ {session.start_iso} (logs={len(logs)})", flush=True)
         if session is not None:
             for e in new_lines:
                 session.add(e)
+                # live scroll: show each captured audio line so the window isn't dead
+                print(f"  [{e.get('severity','?')}/{e.get('category','?')}] {e.get('log','')}: {e.get('line','')[:120]}", flush=True)
             idle = time.time() - session.last_activity
             if not active_now and idle > IDLE_TIMEOUT_SEC:
                 out = session.finalize()
-                print(f"[autocapture] session END; lines={len(session.lines)} -> {out}")
+                print(f"[autocapture] session END; lines={len(session.lines)} -> {out}", flush=True)
                 session = None
+
+        # heartbeat so you can SEE it's alive even when no audio is happening
+        if not once and (time.time() - last_hb) >= HEARTBEAT_SEC:
+            last_hb = time.time()
+            ages = ", ".join(f"{p.name} {int(time.time() - p.stat().st_mtime)}s" for p in logs if p.exists())
+            sess = f"on/{len(session.lines)}行" if session else "off"
+            print(f"[心跳] 监听中 active={active_now} 会话={sess} | {ages or '无日志'}", flush=True)
+
         if once:
             if session is not None:
                 out = session.finalize()
