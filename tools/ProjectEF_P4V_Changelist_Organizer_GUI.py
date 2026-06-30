@@ -2799,9 +2799,12 @@ class OrganizerGui(tk.Tk):
         self.run_p4_operation_async("Reconcile WwiseBanks", worker, done)
 
     def detect_offline_audio_changes(self) -> None:
-        """Fast, SCOPED reconcile -n: only the known audio paths (AutoConfig targets +
-        audio scan roots + WwiseBanks), not the whole project. Lists files changed on
-        disk but not yet opened in P4, and offers to reconcile them into a changelist."""
+        """Fast, scoped reconcile -n over audio-candidate paths.
+
+        The scope intentionally includes known tool touches, WwiseBanks, and broad
+        Unity audio-candidate roots so UI/VFX/Timeline audio edits are not missed.
+        It is narrower than the whole client, but not limited to pure audio folders.
+        """
         root = self.profile_root()
         profile = self.profile()
         scope: list[str] = []
@@ -2828,7 +2831,7 @@ class OrganizerGui(tk.Tk):
         def done(result: tuple[list[dict[str, str]], list[str]]) -> None:
             found, errors = result
             if not found:
-                msg = "该精准范围内没有 P4 未跟踪的离线改动。"
+                msg = "该音频候选范围内没有 P4 未跟踪的离线改动。"
                 if errors:
                     msg += "\n\n注意:\n" + "\n".join(errors[:4])
                 self.status_var.set(msg[:300])
@@ -2836,11 +2839,14 @@ class OrganizerGui(tk.Tk):
                 return
             lines = [f"[{f['action']}] {f['file']}" for f in found]
             preview = "\n".join(lines[:40]) + (f"\n... 还有 {len(lines) - 40} 个" if len(lines) > 40 else "")
-            self.status_var.set(f"离线音频改动: {len(found)} 个(精准范围)")
-            edit_files = [f["file"] for f in found if f["action"] == "edit"]
+            self.status_var.set(f"离线音频改动: {len(found)} 个(音频候选范围)")
+            reconcile_files = [f["file"] for f in found if f["action"] in {"edit", "add"}]
+            delete_count = sum(1 for f in found if f["action"] == "delete")
             text = f"发现 {len(found)} 个需要进 CL 的离线改动:\n\n{preview}"
-            if edit_files and messagebox.askyesno("检测离线音频改动", text + f"\n\n是否把其中 {len(edit_files)} 个已改文件 reconcile 进 changelist?"):
-                opened, messages, errs = p4_client.reconcile(edit_files)
+            if delete_count:
+                text += f"\n\n注意: 其中 {delete_count} 个 delete 改动只列出, 不会自动 reconcile。请确认不是误删后再手动处理。"
+            if reconcile_files and messagebox.askyesno("检测离线音频改动", text + f"\n\n是否把其中 {len(reconcile_files)} 个已改/新增文件 reconcile 进 changelist?"):
+                opened, messages, errs = p4_client.reconcile(reconcile_files)
                 out = f"已 reconcile,opened/add: {opened}\n" + "\n".join((messages or errs)[:5])
                 messagebox.showinfo("Reconcile", out[:3000])
                 self.scan()

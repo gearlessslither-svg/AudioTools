@@ -307,6 +307,14 @@
       "launcher": "36_Reaper_Project_Manager.cmd",
       "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_Reaper_Project_Manager.cmd",
       "purpose": "Local GUI for scanning and managing REAPER .rpp projects. Shows all projects under a chosen root, sorts by modified/created date, name, size, or match count, filters by filename/path keywords, optionally searches inside .rpp text, and can open projects, reveal folders, copy paths, or export CSV."
+    },
+    {
+      "menu": "37",
+      "name": "Audio AutoCapture + Briefing",
+      "visible": true,
+      "launcher": "37_AudioAutoCapture_Briefing.cmd",
+      "source_launcher": "G:\\AI\\Material\\Wwise\\Tools\\Start_ProjectEF_AudioAutoCapture_Control.cmd",
+      "purpose": "Background daemon auto-captures ProjectEF audio runtime logs per game session (starts when the game/Unity log goes active), then rolls sessions into daily/weekly briefings of problems + suggested fixes. Control menu: start daemon, run daily/weekly briefing now, register auto-start + scheduled tasks, open reports."
     }
   ]
 }

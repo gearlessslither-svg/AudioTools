@@ -1307,7 +1307,8 @@ class WwiseTemplateApp(tk.Tk):
                 index.scan()
                 self.after(0, lambda: self._scan_done(index, None))
             except Exception as exc:
-                self.after(0, lambda: self._scan_done(None, exc))
+                err = exc
+                self.after(0, lambda err=err: self._scan_done(None, err))
 
         threading.Thread(target=worker, daemon=True).start()
 
