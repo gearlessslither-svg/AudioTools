@@ -192,7 +192,10 @@ def run(unity_root: Path, wwise_root: Path, interval: int, once: bool) -> int:
     session: Session | None = None
     print(f"[autocapture] start; reuse_monitor={_HAVE_MON}; captures -> {CAPTURE_DIR}")
     while True:
-        logs = discover_logs(unity_root)
+        # Only the two real RUNTIME logs: Editor.log (editor Play mode) and Player.log
+        # (standalone Windows build). Excludes editor housekeeping logs (AssetImport/
+        # shadercompiler) so "active" detection means the game is actually running.
+        logs = [p for p in discover_logs(unity_root) if p.name in ("Editor.log", "Player.log")]
         newest = max((p.stat().st_mtime for p in logs if p.exists()), default=0.0)
         active_now = bool(newest) and (time.time() - newest) < ACTIVE_SEC
         new_lines = read_new_audio_lines(logs, offsets, known_events)
